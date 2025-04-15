@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Examples - PokerSim</title>
+    <link rel="stylesheet" href="https://cdn.replit.com/agent/bootstrap-agent-dark-theme.min.css">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">PokerSim</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link" href="/">Home</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/about">About</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/examples">Examples</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-5">
+        <h1 class="display-4">Example Simulations</h1>
+        <p class="lead">Explore PokerSim capabilities through these examples</p>
+        
+        <div class="row mt-5">
+            <div class="col-md-6 mb-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <h4>Basic Game</h4>
+                    </div>
+                    <div class="card-body">
+                        <p>A complete example of a Texas Hold'em poker hand with various agent types.</p>
+                        <p><strong>Features demonstrated:</strong></p>
+                        <ul>
+                            <li>Full game flow with betting rounds</li>
+                            <li>Multiple agent types</li>
+                            <li>Hand evaluation</li>
+                            <li>Pot distribution</li>
+                        </ul>
+                        <pre><code class="language-python">
+from pokersim.game.state import GameState
+from pokersim.agents.random_agent import RandomAgent
+from pokersim.agents.rule_based_agent import RuleBasedAgent
+
+# Set up a game with 6 players
+game_state = GameState(num_players=6)
+
+# Create agents (mix of random and rule-based)
+agents = [
+    RandomAgent(0),
+    RuleBasedAgent(1),
+    RandomAgent(2),
+    RuleBasedAgent(3),
+    RandomAgent(4),
+    RuleBasedAgent(5)
+]
+
+# Deal cards and start the game
+game_state.deal_hole_cards()
+
+# Play through the hand
+while not game_state.is_terminal():
+    current_player = game_state.current_player
+    agent = agents[current_player]
+    action = agent.act(game_state)
+    game_state = game_state.apply_action(action)
+
+# Determine winner and distribute pot
+results = game_state.get_results()
+print(f"Winner: Player {results['winners'][0]}")
+print(f"Winning hand: {results['winning_hand']}")
+print(f"Pot: {results['pot']}")
+                        </code></pre>
+                    </div>
+                    <div class="card-footer">
+                        <a href="https://github.com/example/link-to-basic-game.py" class="btn btn-outline-primary">View Full Example</a>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-6 mb-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <h4>Spin & Go Tournament</h4>
+                    </div>
+                    <div class="card-body">
+                        <p>Simulation of a complete Spin & Go tournament with prize multipliers and eliminations.</p>
+                        <p><strong>Features demonstrated:</strong></p>
+                        <ul>
+                            <li>Prize pool multipliers</li>
+                            <li>Tournament progression</li>
+                            <li>Player eliminations</li>
+                            <li>Blind level increases</li>
+                        </ul>
+                        <pre><code class="language-python">
+from pokersim.game.spingo import SpinGoGame
+from pokersim.agents.advanced_opponent_agent import AdvancedOpponentAgent
+
+# Create a Spin & Go tournament
+tournament = SpinGoGame(
+    buy_in=10,
+    num_players=3,
+    starting_stack=500
+)
+
+# Set up advanced agents
+agents = [
+    AdvancedOpponentAgent(0),
+    AdvancedOpponentAgent(1),
+    AdvancedOpponentAgent(2)
+]
+
+# Run the tournament until completion
+while not tournament.is_tournament_over():
+    # Start a new hand
+    game_state = tournament.start_new_hand()
+    
+    # Play the hand
+    while not game_state.is_terminal():
+        current_player = game_state.current_player
+        action = agents[current_player].act(game_state)
+        game_state = game_state.apply_action(action)
+    
+    # Update player stacks after the hand
+    tournament.update_stacks_after_hand(game_state)
+
+# Get the winner
+winner = tournament.get_winner()
+print(f"Tournament winner: Player {winner}")
+print(f"Prize: ${tournament.get_prize(winner)}")
+                        </code></pre>
+                    </div>
+                    <div class="card-footer">
+                        <a href="https://github.com/example/link-to-spingo.py" class="btn btn-outline-primary">View Full Example</a>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-6 mb-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <h4>Deep CFR Training</h4>
+                    </div>
+                    <div class="card-body">
+                        <p>Training a poker agent using Deep Counterfactual Regret Minimization.</p>
+                        <p><strong>Features demonstrated:</strong></p>
+                        <ul>
+                            <li>Deep CFR algorithm implementation</li>
+                            <li>Neural network integration</li>
+                            <li>Agent evaluation</li>
+                            <li>Performance metrics</li>
+                        </ul>
+                        <pre><code class="language-python">
+from pokersim.algorithms.deep_cfr import DeepCFR
+from pokersim.ml.models import ValueNetwork
+import torch
+
+# Create value networks
+value_net = ValueNetwork(
+    input_size=128,
+    hidden_size=256,
+    output_size=1
+)
+
+# Initialize Deep CFR algorithm
+deep_cfr = DeepCFR(
+    value_network=value_net,
+    game_type='holdem',
+    num_iterations=1000,
+    memory_size=10000,
+    batch_size=128,
+    learning_rate=0.001
+)
+
+# Train the agent
+deep_cfr.train()
+
+# Evaluate against baseline agents
+results = deep_cfr.evaluate(num_games=1000)
+print(f"Win rate: {results['win_rate']:.2f}")
+print(f"Average profit: {results['avg_profit']:.2f}")
+                        </code></pre>
+                    </div>
+                    <div class="card-footer">
+                        <a href="https://github.com/example/link-to-deep-cfr.py" class="btn btn-outline-primary">View Full Example</a>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-6 mb-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <h4>Advanced Opponent Modeling</h4>
+                    </div>
+                    <div class="card-body">
+                        <p>Creating sophisticated opponents with different playing styles and adaptability.</p>
+                        <p><strong>Features demonstrated:</strong></p>
+                        <ul>
+                            <li>Opponent profiles and playing styles</li>
+                            <li>Adaptation to player behavior</li>
+                            <li>Hand strength evaluation</li>
+                            <li>Position-based strategy</li>
+                        </ul>
+                        <pre><code class="language-python">
+from pokersim.agents.advanced_opponent_agent import (
+    AdvancedOpponentAgent, 
+    AdvancedOpponentProfile
+)
+
+# Create different opponent profiles
+tight_aggressive = AdvancedOpponentProfile(
+    aggression=0.8,
+    bluff_frequency=0.1,
+    call_threshold=0.6,
+    raise_threshold=0.7
+)
+
+loose_passive = AdvancedOpponentProfile(
+    aggression=0.3,
+    bluff_frequency=0.4,
+    call_threshold=0.3,
+    raise_threshold=0.7
+)
+
+loose_aggressive = AdvancedOpponentProfile(
+    aggression=0.9,
+    bluff_frequency=0.3,
+    call_threshold=0.3,
+    raise_threshold=0.5
+)
+
+# Create agents with different profiles
+agents = [
+    AdvancedOpponentAgent(0, tight_aggressive),
+    AdvancedOpponentAgent(1, loose_passive),
+    AdvancedOpponentAgent(2, loose_aggressive)
+]
+
+# Use these agents in game simulations
+game_state = GameState(num_players=3)
+game_state.deal_hole_cards()
+
+while not game_state.is_terminal():
+    current_player = game_state.current_player
+    action = agents[current_player].act(game_state)
+    game_state = game_state.apply_action(action)
+                        </code></pre>
+                    </div>
+                    <div class="card-footer">
+                        <a href="https://github.com/example/link-to-opponents.py" class="btn btn-outline-primary">View Full Example</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer class="bg-dark text-light py-4 mt-5">
+        <div class="container">
+            <div class="row">
+                <div class="col-md-6">
+                    <h5>PokerSim</h5>
+                    <p>Advanced Poker Simulation Framework</p>
+                </div>
+                <div class="col-md-6 text-md-end">
+                    <p>&copy; 2025 PokerSim Project</p>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
