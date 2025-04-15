@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.10.1",
     "numba>=0.61.2",
     "numpy>=2.2.4",
+    "pandas>=2.2.3",
     "psycopg2-binary>=2.9.10",
     "sqlalchemy>=2.0.40",
     "tensorflow>=2.14.0",

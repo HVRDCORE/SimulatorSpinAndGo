@@ -1,593 +1,398 @@
 """
-Distributed training utilities for poker AI.
+Distributed training utilities for the poker simulator.
 
-This module provides tools for distributing poker AI training across multiple
-processes, machines, and GPUs using PyTorch's distributed training capabilities.
+This module provides utilities for distributed training of poker agents,
+including multi-GPU and multi-machine training using PyTorch and TensorFlow.
 """
 
 import os
-import random
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from typing import List, Dict, Tuple, Any, Optional, Union, Callable
-import time
 import logging
+import json
+import time
+import socket
+from typing import Dict, List, Any, Optional, Union, Tuple, Callable
+import multiprocessing
 from functools import partial
 
+# Conditional imports for distributed training libraries
+try:
+    import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+from pokersim.config.config_manager import get_config
+from pokersim.utils.gpu_optimization import get_gpu_manager
+from pokersim.ml.model_io import get_model_io
+
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("pokersim.training.distributed")
 
 
-def setup_distributed(rank: int, world_size: int, backend: str = "nccl"):
+class DistributedTrainer:
     """
-    Initialize the distributed environment.
+    Distributed trainer for poker agents.
     
-    Args:
-        rank (int): Process rank.
-        world_size (int): Total number of processes.
-        backend (str, optional): PyTorch distributed backend. Defaults to "nccl".
+    This class provides methods for training poker agents in a distributed
+    manner, using multiple GPUs or machines.
+    
+    Attributes:
+        config (Dict[str, Any]): Configuration settings.
+        world_size (int): Number of training processes.
+        framework (str): Deep learning framework being used.
+        gpu_manager: GPU resource manager.
+        model_io: Model I/O manager.
     """
-    # Set environment variables for PyTorch distributed
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
     
-    # Initialize process group
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    
-    # Set device for this process
-    torch.cuda.set_device(rank)
-    
-    logger.info(f"Initialized process {rank}/{world_size}")
-
-
-def cleanup_distributed():
-    """Clean up distributed training resources."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def get_device(local_rank: int) -> torch.device:
-    """
-    Get the appropriate device for the current process.
-    
-    Args:
-        local_rank (int): Local process rank.
-    
-    Returns:
-        torch.device: Device for the current process.
-    """
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{local_rank}")
-    else:
-        return torch.device("cpu")
-
-
-def prepare_model_for_distributed(model: nn.Module, local_rank: int) -> nn.Module:
-    """
-    Prepare a model for distributed training.
-    
-    Args:
-        model (nn.Module): PyTorch model.
-        local_rank (int): Local process rank.
-    
-    Returns:
-        nn.Module: Model wrapped for distributed training.
-    """
-    # Move model to the appropriate device
-    device = get_device(local_rank)
-    model = model.to(device)
-    
-    # Wrap model with DDP
-    ddp_model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-    
-    return ddp_model
-
-
-def distributed_trainer(rank: int, world_size: int, training_fn: Callable, args: Tuple):
-    """
-    Distributed trainer function that runs on each process.
-    
-    Args:
-        rank (int): Process rank.
-        world_size (int): Total number of processes.
-        training_fn (Callable): Training function to run.
-        args (Tuple): Arguments to pass to the training function.
-    """
-    try:
-        # Initialize distributed environment
-        setup_distributed(rank, world_size)
+    def __init__(self, world_size: Optional[int] = None, framework: str = "auto"):
+        """
+        Initialize the distributed trainer.
         
-        # Run training function
-        training_fn(rank, world_size, *args)
-    except Exception as e:
-        logger.error(f"Error in process {rank}: {e}")
-        raise e
-    finally:
+        Args:
+            world_size (Optional[int], optional): Number of processes. Defaults to None.
+            framework (str, optional): Deep learning framework to use. Defaults to "auto".
+        """
+        # Get configuration
+        config = get_config()
+        self.config = config.to_dict()
+        
+        # Get GPU manager and model I/O
+        self.gpu_manager = get_gpu_manager()
+        self.model_io = get_model_io()
+        
+        # Set world size (number of processes)
+        if world_size is None:
+            self.world_size = self.config["training"]["num_workers"]
+        else:
+            self.world_size = world_size
+        
+        # Set framework
+        if framework == "auto":
+            self.framework = self.gpu_manager.framework
+        else:
+            self.framework = framework
+        
+        # Check if distributed training is possible
+        self.can_distribute = self._check_distributed_availability()
+        
+        if not self.can_distribute:
+            logger.warning("Distributed training not available")
+    
+    def _check_distributed_availability(self) -> bool:
+        """
+        Check if distributed training is available.
+        
+        Returns:
+            bool: Whether distributed training is available.
+        """
+        # Check for supported frameworks
+        framework_available = (
+            (self.framework == "pytorch" and TORCH_AVAILABLE) or
+            (self.framework == "tensorflow" and TF_AVAILABLE)
+        )
+        if not framework_available:
+            logger.warning(f"Framework {self.framework} not available")
+            return False
+        
+        # Check for GPUs
+        if not self.gpu_manager.use_gpu:
+            logger.warning("GPU acceleration disabled")
+            return self.world_size > 1  # Can still distribute across CPUs
+        
+        # Check for sufficient GPU devices
+        num_devices = len(self.gpu_manager.available_devices)
+        if num_devices < self.world_size:
+            logger.warning(f"Requested {self.world_size} processes but only {num_devices} GPUs available")
+            self.world_size = max(1, num_devices)
+        
+        return self.world_size > 1
+    
+    def train_distributed(self, training_fn: Callable, *args, **kwargs) -> Any:
+        """
+        Run distributed training.
+        
+        Args:
+            training_fn (Callable): Training function to run distributed.
+            *args: Arguments to pass to the training function.
+            **kwargs: Keyword arguments to pass to the training function.
+        
+        Returns:
+            Any: Results from the training function.
+        """
+        if not self.can_distribute:
+            logger.info("Running in single-process mode")
+            return training_fn(*args, **kwargs)
+        
+        # Set up distributed training based on framework
+        if self.framework == "pytorch" and TORCH_AVAILABLE:
+            return self._train_distributed_pytorch(training_fn, *args, **kwargs)
+        elif self.framework == "tensorflow" and TF_AVAILABLE:
+            return self._train_distributed_tensorflow(training_fn, *args, **kwargs)
+        else:
+            logger.warning(f"Unsupported framework for distributed training: {self.framework}")
+            return training_fn(*args, **kwargs)
+    
+    def _train_distributed_pytorch(self, training_fn: Callable, *args, **kwargs) -> Any:
+        """
+        Run distributed training with PyTorch.
+        
+        Args:
+            training_fn (Callable): Training function to run distributed.
+            *args: Arguments to pass to the training function.
+            **kwargs: Keyword arguments to pass to the training function.
+        
+        Returns:
+            Any: Results from the training function.
+        """
+        # Initialize distributed process group
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        
+        # Prepare arguments for each process
+        wrapped_fn = partial(self._pytorch_worker_fn, training_fn, *args, **kwargs)
+        
+        # Start processes
+        if self.world_size > 1:
+            mp.spawn(wrapped_fn, nprocs=self.world_size, join=True)
+            results = {"distributed": True, "world_size": self.world_size}
+        else:
+            results = wrapped_fn(0)
+        
+        return results
+    
+    def _pytorch_worker_fn(self, training_fn: Callable, rank: int, *args, **kwargs) -> Any:
+        """
+        Worker function for PyTorch distributed training.
+        
+        Args:
+            training_fn (Callable): Training function.
+            rank (int): Process rank.
+            *args: Arguments to pass to the training function.
+            **kwargs: Keyword arguments to pass to the training function.
+        
+        Returns:
+            Any: Results from the training function.
+        """
+        # Initialize distributed process group
+        dist.init_process_group(
+            backend="nccl" if self.gpu_manager.use_gpu else "gloo",
+            init_method=f"env://",
+            world_size=self.world_size,
+            rank=rank
+        )
+        
+        # Set device for this process
+        if self.gpu_manager.use_gpu:
+            torch.cuda.set_device(rank)
+        
+        # Update kwargs with process information
+        kwargs["rank"] = rank
+        kwargs["world_size"] = self.world_size
+        kwargs["device"] = torch.device(f"cuda:{rank}" if self.gpu_manager.use_gpu else "cpu")
+        
+        # Run the training function
+        results = training_fn(*args, **kwargs)
+        
         # Clean up
-        cleanup_distributed()
-
-
-def launch_distributed_training(training_fn: Callable, args: Tuple, world_size: int):
-    """
-    Launch distributed training across multiple processes.
+        dist.destroy_process_group()
+        
+        return results
     
-    Args:
-        training_fn (Callable): Training function to run.
-        args (Tuple): Arguments to pass to the training function.
-        world_size (int): Number of processes to launch.
-    """
-    if world_size > 1 and torch.cuda.is_available():
-        # Launch multiple processes
-        mp.spawn(
-            distributed_trainer,
-            args=(world_size, training_fn, args),
-            nprocs=world_size,
-            join=True
-        )
-    else:
-        # Run in a single process
-        logger.info("Running in a single process (no distributed training)")
-        training_fn(0, 1, *args)
-
-
-def all_reduce_dict(input_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Perform all-reduce operation on a dictionary of tensors.
+    def _train_distributed_tensorflow(self, training_fn: Callable, *args, **kwargs) -> Any:
+        """
+        Run distributed training with TensorFlow.
+        
+        Args:
+            training_fn (Callable): Training function to run distributed.
+            *args: Arguments to pass to the training function.
+            **kwargs: Keyword arguments to pass to the training function.
+        
+        Returns:
+            Any: Results from the training function.
+        """
+        # Set up TensorFlow distribution strategy
+        if self.gpu_manager.use_gpu and len(self.gpu_manager.available_devices) > 0:
+            # Multi-GPU strategy
+            strategy = tf.distribute.MirroredStrategy()
+        else:
+            # CPU strategy
+            strategy = tf.distribute.get_strategy()
+        
+        # Add strategy to kwargs
+        kwargs["strategy"] = strategy
+        kwargs["world_size"] = self.world_size
+        
+        # Run the training function within the strategy scope
+        with strategy.scope():
+            results = training_fn(*args, **kwargs)
+        
+        return results
     
-    Args:
-        input_dict (Dict[str, torch.Tensor]): Dictionary of tensors.
+    def gather_results(self, local_results: Any, rank: int, world_size: int) -> List[Any]:
+        """
+        Gather results from all processes.
+        
+        Args:
+            local_results (Any): Local results from this process.
+            rank (int): Process rank.
+            world_size (int): Total number of processes.
+        
+        Returns:
+            List[Any]: List of results from all processes.
+        """
+        if not self.can_distribute or world_size <= 1:
+            return [local_results]
+        
+        # Gather results based on framework
+        if self.framework == "pytorch" and TORCH_AVAILABLE:
+            return self._gather_results_pytorch(local_results, rank, world_size)
+        elif self.framework == "tensorflow" and TF_AVAILABLE:
+            return self._gather_results_tensorflow(local_results, rank, world_size)
+        else:
+            logger.warning(f"Unsupported framework for result gathering: {self.framework}")
+            return [local_results]
+    
+    def _gather_results_pytorch(self, local_results: Any, rank: int, world_size: int) -> List[Any]:
+        """
+        Gather results from all processes using PyTorch.
+        
+        Args:
+            local_results (Any): Local results from this process.
+            rank (int): Process rank.
+            world_size (int): Total number of processes.
+        
+        Returns:
+            List[Any]: List of results from all processes.
+        """
+        # Convert results to JSON string for transmission
+        local_json = json.dumps(local_results)
+        local_tensor = torch.tensor(bytearray(local_json.encode()), dtype=torch.uint8)
+        
+        # Get size of each result tensor
+        size_tensor = torch.tensor([local_tensor.numel()], dtype=torch.long)
+        size_list = [torch.tensor([0], dtype=torch.long) for _ in range(world_size)]
+        
+        # Gather sizes
+        dist.all_gather(size_list, size_tensor)
+        
+        # Create tensors for gathering results
+        max_size = max(size.item() for size in size_list)
+        if local_tensor.numel() < max_size:
+            padding = torch.zeros(max_size - local_tensor.numel(), dtype=torch.uint8)
+            local_tensor = torch.cat((local_tensor, padding))
+        
+        tensor_list = [torch.zeros(max_size, dtype=torch.uint8) for _ in range(world_size)]
+        
+        # Gather results
+        dist.all_gather(tensor_list, local_tensor)
+        
+        # Decode results
+        results = []
+        for tensor, size in zip(tensor_list, size_list):
+            bytes_data = bytes(tensor[:size.item()].tolist())
+            json_str = bytes_data.decode()
+            result = json.loads(json_str)
+            results.append(result)
+        
+        return results
+    
+    def _gather_results_tensorflow(self, local_results: Any, rank: int, world_size: int) -> List[Any]:
+        """
+        Gather results from all processes using TensorFlow.
+        
+        Args:
+            local_results (Any): Local results from this process.
+            rank (int): Process rank.
+            world_size (int): Total number of processes.
+        
+        Returns:
+            List[Any]: List of results from all processes.
+        """
+        # TensorFlow's distribution strategy handles this differently
+        # For simplicity, we just return the local results
+        # In a real implementation, this would use TensorFlow's mechanisms
+        return [local_results]
+    
+    def reduce_results(self, all_results: List[Any]) -> Any:
+        """
+        Reduce results from all processes to a single result.
+        
+        Args:
+            all_results (List[Any]): Results from all processes.
+        
+        Returns:
+            Any: Combined result.
+        """
+        if not all_results:
+            return None
+        
+        # This is a simplified implementation
+        # In a real-world scenario, this would depend on the specific format of results
+        
+        # If results are dictionaries, combine them
+        if all(isinstance(r, dict) for r in all_results):
+            combined = {}
+            for result in all_results:
+                for key, value in result.items():
+                    if key in combined:
+                        # If value is numeric, sum it
+                        if isinstance(value, (int, float)) and isinstance(combined[key], (int, float)):
+                            combined[key] += value
+                        # If value is a list, extend it
+                        elif isinstance(value, list) and isinstance(combined[key], list):
+                            combined[key].extend(value)
+                        # Otherwise, keep the value from the first result
+                    else:
+                        combined[key] = value
+            return combined
+        
+        # If results are lists, concatenate them
+        elif all(isinstance(r, list) for r in all_results):
+            combined = []
+            for result in all_results:
+                combined.extend(result)
+            return combined
+        
+        # If results are numeric, sum them
+        elif all(isinstance(r, (int, float)) for r in all_results):
+            return sum(all_results)
+        
+        # Otherwise, return the results as a list
+        return all_results
+
+
+# Utility functions
+def find_free_port() -> int:
+    """
+    Find a free port for distributed training.
     
     Returns:
-        Dict[str, torch.Tensor]: Dictionary with reduced tensors.
+        int: Free port number.
     """
-    if not dist.is_initialized():
-        return input_dict
-    
-    # Make sure all tensors are on CUDA
-    for k, v in input_dict.items():
-        if not v.is_cuda:
-            input_dict[k] = v.cuda()
-    
-    # Create a list of tensors and keys
-    keys = list(input_dict.keys())
-    tensors = [input_dict[k] for k in keys]
-    
-    # All-reduce
-    dist.all_reduce_coalesced(tensors, dist.ReduceOp.SUM)
-    
-    # Divide by world size
-    world_size = dist.get_world_size()
-    reduced_dict = {k: t / world_size for k, t in zip(keys, tensors)}
-    
-    return reduced_dict
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
-def broadcast_model_parameters(model: nn.Module, src: int = 0):
-    """
-    Broadcast model parameters from one process to all others.
-    
-    Args:
-        model (nn.Module): PyTorch model.
-        src (int, optional): Source process. Defaults to 0.
-    """
-    if not dist.is_initialized():
-        return
-    
-    for param in model.parameters():
-        dist.broadcast(param.data, src=src)
+# Singleton instance
+_instance = None
 
-
-class DistributedReplayBuffer:
+def get_distributed_trainer() -> DistributedTrainer:
     """
-    Distributed replay buffer for reinforcement learning.
+    Get the singleton distributed trainer instance.
     
-    This buffer distributes experiences across multiple processes and
-    synchronizes sampling to ensure all processes have the same data.
-    
-    Attributes:
-        capacity (int): Maximum size of the buffer.
-        batch_size (int): Batch size for sampling.
-        rank (int): Process rank.
-        world_size (int): Total number of processes.
-        buffer (List): List of experiences.
+    Returns:
+        DistributedTrainer: Distributed trainer instance.
     """
-    
-    def __init__(self, capacity: int, batch_size: int, 
-                rank: int, world_size: int):
-        """
-        Initialize a distributed replay buffer.
-        
-        Args:
-            capacity (int): Maximum size of the buffer.
-            batch_size (int): Batch size for sampling.
-            rank (int): Process rank.
-            world_size (int): Total number of processes.
-        """
-        self.capacity = capacity
-        self.batch_size = batch_size
-        self.rank = rank
-        self.world_size = world_size
-        
-        # Each process stores a portion of the buffer
-        self.local_capacity = capacity // world_size
-        self.buffer = []
-        
-        logger.info(f"Process {rank}: Initialized distributed buffer with local capacity {self.local_capacity}")
-    
-    def push(self, experience: Tuple):
-        """
-        Add an experience to the buffer.
-        
-        Args:
-            experience (Tuple): Experience tuple.
-        """
-        # Determine if this process should store the experience
-        if len(self.buffer) < self.local_capacity:
-            self.buffer.append(experience)
-        else:
-            # Replace a random experience
-            idx = random.randint(0, self.local_capacity - 1)
-            self.buffer[idx] = experience
-    
-    def sample(self) -> List:
-        """
-        Sample a batch of experiences from all processes.
-        
-        Returns:
-            List: A batch of experiences.
-        """
-        # Each process samples locally
-        local_batch_size = self.batch_size // self.world_size
-        local_samples = random.sample(self.buffer, min(local_batch_size, len(self.buffer)))
-        
-        # Convert to tensors
-        local_samples_tensor = self._experiences_to_tensor(local_samples)
-        
-        # Gather samples from all processes
-        all_samples = self._gather_samples(local_samples_tensor)
-        
-        # Convert back to experience tuples
-        return self._tensor_to_experiences(all_samples)
-    
-    def _experiences_to_tensor(self, experiences: List[Tuple]) -> torch.Tensor:
-        """
-        Convert experiences to a tensor for communication.
-        
-        Args:
-            experiences (List[Tuple]): List of experience tuples.
-        
-        Returns:
-            torch.Tensor: Tensor representation of experiences.
-        """
-        # This is a simplified implementation - in practice, you would need to
-        # handle different types of experiences and ensure proper serialization
-        
-        # For now, just return a dummy tensor
-        return torch.zeros(len(experiences), 10).cuda()
-    
-    def _tensor_to_experiences(self, tensor: torch.Tensor) -> List[Tuple]:
-        """
-        Convert a tensor back to experiences.
-        
-        Args:
-            tensor (torch.Tensor): Tensor representation of experiences.
-        
-        Returns:
-            List[Tuple]: List of experience tuples.
-        """
-        # This is a simplified implementation - in practice, you would need to
-        # deserialize the tensor back to experiences
-        
-        # For now, just return dummy experiences
-        return [(None, None, 0.0, None, False) for _ in range(tensor.shape[0])]
-    
-    def _gather_samples(self, local_samples: torch.Tensor) -> torch.Tensor:
-        """
-        Gather samples from all processes.
-        
-        Args:
-            local_samples (torch.Tensor): Local samples tensor.
-        
-        Returns:
-            torch.Tensor: Tensor with samples from all processes.
-        """
-        if not dist.is_initialized():
-            return local_samples
-        
-        # Get shape information
-        local_size = torch.tensor([local_samples.shape[0]], device=local_samples.device)
-        all_sizes = [torch.zeros_like(local_size) for _ in range(self.world_size)]
-        
-        # Gather sizes from all processes
-        dist.all_gather(all_sizes, local_size)
-        all_sizes = [size.item() for size in all_sizes]
-        
-        # Prepare output tensor
-        total_size = sum(all_sizes)
-        output_shape = list(local_samples.shape)
-        output_shape[0] = total_size
-        all_samples = torch.zeros(output_shape, device=local_samples.device)
-        
-        # Gather samples from all processes
-        if sum(all_sizes) > 0:
-            # Perform gather operation
-            start_idx = 0
-            for i, size in enumerate(all_sizes):
-                if size > 0:
-                    end_idx = start_idx + size
-                    all_samples_i = all_samples[start_idx:end_idx]
-                    
-                    if i == self.rank:
-                        all_samples_i.copy_(local_samples)
-                    else:
-                        dist.broadcast(all_samples_i, i)
-                    
-                    start_idx = end_idx
-        
-        return all_samples
-
-
-class DistributedLearner:
-    """
-    Distributed learner for poker AI training.
-    
-    This class handles distributed training of poker AI models
-    across multiple processes and machines.
-    
-    Attributes:
-        rank (int): Process rank.
-        world_size (int): Total number of processes.
-        model (nn.Module): Model to train.
-        optimizer (torch.optim.Optimizer): Optimizer for training.
-        replay_buffer (DistributedReplayBuffer): Distributed replay buffer.
-    """
-    
-    def __init__(self, model: nn.Module, rank: int, world_size: int, 
-                replay_buffer_size: int = 100000, batch_size: int = 128,
-                learning_rate: float = 0.001):
-        """
-        Initialize a distributed learner.
-        
-        Args:
-            model (nn.Module): Model to train.
-            rank (int): Process rank.
-            world_size (int): Total number of processes.
-            replay_buffer_size (int, optional): Replay buffer size. Defaults to 100000.
-            batch_size (int, optional): Batch size. Defaults to 128.
-            learning_rate (float, optional): Learning rate. Defaults to 0.001.
-        """
-        self.rank = rank
-        self.world_size = world_size
-        
-        # Prepare model for distributed training
-        self.device = get_device(rank)
-        self.model = prepare_model_for_distributed(model, rank)
-        
-        # Create optimizer
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
-        
-        # Create replay buffer
-        self.replay_buffer = DistributedReplayBuffer(
-            capacity=replay_buffer_size,
-            batch_size=batch_size,
-            rank=rank,
-            world_size=world_size
-        )
-        
-        # Metrics
-        self.train_steps = 0
-        self.losses = []
-    
-    def add_experience(self, experience: Tuple):
-        """
-        Add an experience to the replay buffer.
-        
-        Args:
-            experience (Tuple): Experience tuple.
-        """
-        self.replay_buffer.push(experience)
-    
-    def train_step(self) -> float:
-        """
-        Perform a distributed training step.
-        
-        Returns:
-            float: Training loss.
-        """
-        # Check if we have enough samples
-        if len(self.replay_buffer.buffer) < self.replay_buffer.batch_size // self.world_size:
-            return 0.0
-        
-        # Sample from replay buffer
-        batch = self.replay_buffer.sample()
-        
-        # Process batch
-        states, actions, rewards, next_states, dones = zip(*batch)
-        
-        # Convert to tensors
-        states = torch.FloatTensor(np.array(states)).to(self.device)
-        actions = torch.LongTensor(np.array(actions)).to(self.device)
-        rewards = torch.FloatTensor(np.array(rewards)).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
-        dones = torch.FloatTensor(np.array(dones, dtype=np.float32)).unsqueeze(1).to(self.device)
-        
-        # Forward pass
-        predictions = self.model(states)
-        
-        # Compute loss
-        loss = nn.MSELoss()(predictions, rewards)
-        
-        # Backward pass
-        self.optimizer.zero_grad()
-        loss.backward()
-        
-        # Synchronize gradients
-        self.sync_gradients()
-        
-        # Optimizer step
-        self.optimizer.step()
-        
-        # Track metrics
-        self.train_steps += 1
-        self.losses.append(loss.item())
-        
-        return loss.item()
-    
-    def sync_gradients(self):
-        """Synchronize gradients across processes."""
-        if not dist.is_initialized():
-            return
-        
-        # All-reduce gradients
-        for param in self.model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                param.grad.data.div_(self.world_size)
-    
-    def sync_model(self):
-        """Synchronize model parameters across processes."""
-        if not dist.is_initialized():
-            return
-        
-        # Broadcast model parameters from process 0
-        broadcast_model_parameters(self.model.module, src=0)
-    
-    def save_checkpoint(self, filepath: str):
-        """
-        Save a checkpoint of the distributed training.
-        
-        Args:
-            filepath (str): Path to save the checkpoint.
-        """
-        # Only save from rank 0
-        if self.rank == 0:
-            checkpoint = {
-                'model_state_dict': self.model.module.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'train_steps': self.train_steps,
-                'losses': self.losses
-            }
-            torch.save(checkpoint, filepath)
-            logger.info(f"Saved checkpoint to {filepath}")
-    
-    def load_checkpoint(self, filepath: str):
-        """
-        Load a checkpoint for distributed training.
-        
-        Args:
-            filepath (str): Path to the checkpoint.
-        """
-        if not os.path.exists(filepath):
-            logger.warning(f"Checkpoint {filepath} does not exist")
-            return
-        
-        # Load checkpoint
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
-        # Load model parameters
-        self.model.module.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load optimizer state
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        # Load metrics
-        self.train_steps = checkpoint['train_steps']
-        self.losses = checkpoint['losses']
-        
-        # Synchronize model parameters
-        self.sync_model()
-        
-        logger.info(f"Loaded checkpoint from {filepath}")
-
-
-class DistributedTrainingConfig:
-    """
-    Configuration for distributed training.
-    
-    Attributes:
-        world_size (int): Number of processes to use.
-        backend (str): Distributed backend to use.
-        checkpoint_interval (int): Interval for saving checkpoints.
-        sync_interval (int): Interval for synchronizing models.
-        num_episodes (int): Number of episodes to train for.
-        eval_interval (int): Interval for evaluation.
-    """
-    
-    def __init__(self, world_size: int = 1, backend: str = "nccl",
-                checkpoint_interval: int = 1000, sync_interval: int = 10,
-                num_episodes: int = 10000, eval_interval: int = 100):
-        """
-        Initialize distributed training configuration.
-        
-        Args:
-            world_size (int, optional): Number of processes. Defaults to 1.
-            backend (str, optional): Distributed backend. Defaults to "nccl".
-            checkpoint_interval (int, optional): Checkpoint interval. Defaults to 1000.
-            sync_interval (int, optional): Sync interval. Defaults to 10.
-            num_episodes (int, optional): Number of episodes. Defaults to 10000.
-            eval_interval (int, optional): Evaluation interval. Defaults to 100.
-        """
-        self.world_size = world_size
-        self.backend = backend
-        self.checkpoint_interval = checkpoint_interval
-        self.sync_interval = sync_interval
-        self.num_episodes = num_episodes
-        self.eval_interval = eval_interval
-        
-        # Adjust world size based on available GPUs
-        if torch.cuda.is_available():
-            num_gpus = torch.cuda.device_count()
-            if self.world_size > num_gpus:
-                logger.warning(f"Requested {self.world_size} processes but only {num_gpus} GPUs available")
-                self.world_size = num_gpus
-        else:
-            if self.world_size > 1:
-                logger.warning("No GPUs available, setting world_size to 1")
-                self.world_size = 1
-                self.backend = "gloo"
-
-
-def train_distributed(model_fn: Callable, training_fn: Callable, config: DistributedTrainingConfig,
-                    checkpoint_dir: str = "./checkpoints", *args, **kwargs):
-    """
-    Train a model using distributed training.
-    
-    Args:
-        model_fn (Callable): Function that creates the model.
-        training_fn (Callable): Function that performs training.
-        config (DistributedTrainingConfig): Training configuration.
-        checkpoint_dir (str, optional): Directory for checkpoints. Defaults to "./checkpoints".
-    """
-    # Create checkpoint directory
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Wrap training function
-    def wrapped_training_fn(rank: int, world_size: int, *training_args):
-        # Create model
-        model = model_fn()
-        
-        # Create learner
-        learner = DistributedLearner(
-            model=model,
-            rank=rank,
-            world_size=world_size,
-            replay_buffer_size=kwargs.get('replay_buffer_size', 100000),
-            batch_size=kwargs.get('batch_size', 128),
-            learning_rate=kwargs.get('learning_rate', 0.001)
-        )
-        
-        # Load checkpoint if available
-        checkpoint_path = os.path.join(checkpoint_dir, "latest_checkpoint.pt")
-        if os.path.exists(checkpoint_path):
-            learner.load_checkpoint(checkpoint_path)
-        
-        # Run training function
-        training_fn(learner, config, *training_args)
-    
-    # Launch distributed training
-    launch_distributed_training(wrapped_training_fn, args, config.world_size)
+    global _instance
+    if _instance is None:
+        _instance = DistributedTrainer()
+    return _instance

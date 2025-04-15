@@ -1,6 +1,6 @@
 """
-Poker training package.
+Training package for the poker simulator.
 
-This package contains modules for training poker AI agents, including
-distributed training and optimization tools.
+This package provides utilities for training poker agents using various
+machine learning algorithms, including distributed training capabilities.
 """

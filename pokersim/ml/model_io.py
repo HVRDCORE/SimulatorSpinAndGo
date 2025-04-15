@@ -1,365 +1,368 @@
 """
-Module for saving and loading neural network models in the poker AI framework.
+Model I/O utilities for the poker simulator.
 
-This module provides utility functions for serializing and deserializing
-trained models, which is essential for long-running training processes
-and for deploying trained agents.
+This module provides utilities for saving and loading machine learning models,
+along with their metadata, for use in poker agents. It supports both PyTorch
+and TensorFlow models with a unified interface.
 """
 
 import os
-import torch
 import json
-import numpy as np
-from typing import Dict, Any, Optional, Union
-from datetime import datetime
+import time
+import logging
+from typing import Dict, Any, Optional, Union, Tuple, List
+import pickle
 
-from pokersim.ml.models import (
-    ValueNetwork, PolicyNetwork, DuelingQNetwork, PokerTransformer,
-    create_value_network, create_policy_network, create_dueling_q_network, create_poker_transformer
-)
+# Conditional imports for PyTorch and TensorFlow
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+from pokersim.config.config_manager import get_config
+
+# Configure logging
+logger = logging.getLogger("pokersim.ml.model_io")
 
 
-def save_model(model: torch.nn.Module, path: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+class ModelIO:
     """
-    Save a PyTorch model to disk.
+    Model I/O manager for saving and loading ML models.
     
-    Args:
-        model (torch.nn.Module): The model to save.
-        path (str): Path where the model will be saved.
-        metadata (Optional[Dict[str, Any]], optional): Additional metadata to save. 
-                                                      Defaults to None.
+    This class provides methods for saving and loading machine learning models
+    for poker agents, along with their metadata. It supports both PyTorch and
+    TensorFlow models with a unified interface.
+    
+    Attributes:
+        config (Dict[str, Any]): Configuration settings.
+        save_dir (str): Directory for saving models.
+        supported_frameworks (List[str]): List of supported ML frameworks.
     """
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     
-    # Default metadata if none provided
-    if metadata is None:
-        metadata = {}
-    
-    # Add timestamp
-    metadata['timestamp'] = datetime.now().isoformat()
-    metadata['model_type'] = model.__class__.__name__
-    
-    # Save model state
-    save_dict = {
-        'model_state_dict': model.state_dict(),
-        'metadata': metadata
-    }
-    
-    torch.save(save_dict, path)
-    
-    # Save metadata separately as JSON for easy inspection
-    json_path = path + '.json'
-    with open(json_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-
-
-def load_model(path: str, model_type: Optional[str] = None) -> tuple[torch.nn.Module, Dict[str, Any]]:
-    """
-    Load a PyTorch model from disk.
-    
-    Args:
-        path (str): Path where the model is saved.
-        model_type (Optional[str], optional): Type of model to load. 
-                                            If None, will be inferred from metadata. 
-                                            Defaults to None.
-    
-    Returns:
-        tuple[torch.nn.Module, Dict[str, Any]]: The loaded model and its metadata.
+    def __init__(self, save_dir: Optional[str] = None):
+        """
+        Initialize the model I/O manager.
         
-    Raises:
-        ValueError: If model_type is not specified and cannot be inferred.
-        FileNotFoundError: If the model file doesn't exist.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model file not found at {path}")
-    
-    # Load saved data
-    saved_data = torch.load(path, map_location=torch.device('cpu'))
-    model_state_dict = saved_data['model_state_dict']
-    metadata = saved_data.get('metadata', {})
-    
-    # Determine model type
-    if model_type is None:
-        model_type = metadata.get('model_type')
-        if model_type is None:
-            raise ValueError("Model type not specified and cannot be inferred from metadata")
-    
-    # Create a new model instance based on the type
-    if model_type == 'ValueNetwork':
-        input_size = metadata.get('input_size', 128)
-        hidden_layers = metadata.get('hidden_layers', [256, 256])
-        output_size = metadata.get('output_size', 1)
-        model = create_value_network(input_size, hidden_layers, output_size)
-    
-    elif model_type == 'PolicyNetwork':
-        input_size = metadata.get('input_size', 128)
-        hidden_layers = metadata.get('hidden_layers', [256, 256])
-        action_space_size = metadata.get('action_space_size', 5)
-        model = create_policy_network(input_size, hidden_layers, action_space_size)
-    
-    elif model_type == 'DuelingQNetwork':
-        input_size = metadata.get('input_size', 128)
-        hidden_layers = metadata.get('hidden_layers', [256, 256])
-        action_space_size = metadata.get('action_space_size', 5)
-        model = create_dueling_q_network(input_size, hidden_layers, action_space_size)
-    
-    elif model_type == 'PokerTransformer':
-        input_size = metadata.get('input_size', 128)
-        hidden_size = metadata.get('hidden_size', 256)
-        num_layers = metadata.get('num_layers', 4)
-        num_heads = metadata.get('num_heads', 8)
-        action_space_size = metadata.get('action_space_size', 5)
-        model = create_poker_transformer(input_size, hidden_size, num_layers, num_heads, action_space_size)
-    
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-    
-    # Load the state dict
-    model.load_state_dict(model_state_dict)
-    
-    return model, metadata
-
-
-def save_agent(agent: Any, path: str, agent_type: str, extras: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Save a poker AI agent to disk, including its model and algorithm state.
-    
-    Args:
-        agent (Any): The agent to save (DeepCFR, PPO, etc.)
-        path (str): Path where the agent will be saved.
-        agent_type (str): Type of the agent (e.g., 'deep_cfr', 'ppo')
-        extras (Optional[Dict[str, Any]], optional): Additional data to save.
-                                                    Defaults to None.
-    """
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    
-    # Default extras if none provided
-    if extras is None:
-        extras = {}
-    
-    # Create metadata
-    metadata = {
-        'agent_type': agent_type,
-        'timestamp': datetime.now().isoformat(),
-        **extras
-    }
-    
-    # Create agent-specific save dictionary
-    if agent_type == 'deep_cfr':
-        # For DeepCFR, save the value network
-        model_path = f"{path}_value_network.pt"
-        save_model(
-            agent.value_network, 
-            model_path, 
-            {
-                'input_dim': agent.input_dim,
-                'action_dim': agent.action_dim,
-                'game_type': agent.game_type,
-                'num_players': agent.num_players,
-                'iteration': agent.iteration
-            }
-        )
-        metadata['model_path'] = model_path
+        Args:
+            save_dir (Optional[str], optional): Directory for saving models. Defaults to None.
+        """
+        # Get configuration
+        config = get_config()
+        self.config = config.to_dict()
         
-        # Save additional algorithm state
-        algorithm_state = {
-            'memory_size': agent.memory_size,
-            'batch_size': agent.batch_size,
-            'iteration': agent.iteration,
-            'advantage_losses': agent.advantage_losses
-        }
-        metadata['algorithm_state'] = algorithm_state
-    
-    elif agent_type == 'ppo':
-        # For PPO, save the policy network
-        model_path = f"{path}_policy_network.pt"
-        save_model(
-            agent.model, 
-            model_path, 
-            {
-                'game_type': agent.game_type,
-                'num_players': agent.num_players,
-                'episode': agent.episode
-            }
-        )
-        metadata['model_path'] = model_path
+        # Set save directory
+        if save_dir is None:
+            self.save_dir = self.config["agents"]["save_dir"]
+        else:
+            self.save_dir = save_dir
         
-        # Save additional algorithm state
-        algorithm_state = {
-            'clip_ratio': agent.clip_ratio,
-            'value_coef': agent.value_coef,
-            'entropy_coef': agent.entropy_coef,
-            'batch_size': agent.batch_size,
-            'gae_lambda': agent.gae_lambda,
-            'gamma': agent.gamma,
-            'episode': agent.episode,
-            'policy_losses': agent.policy_losses,
-            'value_losses': agent.value_losses,
-            'entropy_losses': agent.entropy_losses
-        }
-        metadata['algorithm_state'] = algorithm_state
-    
-    else:
-        raise ValueError(f"Unsupported agent type: {agent_type}")
-    
-    # Save agent metadata
-    with open(f"{path}_metadata.json", 'w') as f:
-        json.dump(metadata, f, indent=2)
-
-
-def load_agent(path: str, agent_type: Optional[str] = None) -> Any:
-    """
-    Load a poker AI agent from disk.
-    
-    Args:
-        path (str): Base path where the agent is saved.
-        agent_type (Optional[str], optional): Type of agent to load.
-                                           If None, will be inferred from metadata.
-                                           Defaults to None.
-    
-    Returns:
-        Any: The loaded agent.
+        # Create save directory if it doesn't exist
+        os.makedirs(self.save_dir, exist_ok=True)
         
-    Raises:
-        ValueError: If agent_type is not specified and cannot be inferred.
-        FileNotFoundError: If the agent files don't exist.
-    """
-    metadata_path = f"{path}_metadata.json"
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"Agent metadata not found at {metadata_path}")
-    
-    # Load metadata
-    with open(metadata_path, 'r') as f:
-        metadata = json.load(f)
-    
-    # Determine agent type
-    if agent_type is None:
-        agent_type = metadata.get('agent_type')
-        if agent_type is None:
-            raise ValueError("Agent type not specified and cannot be inferred from metadata")
-    
-    # Load the agent based on type
-    if agent_type == 'deep_cfr':
-        from pokersim.algorithms.deep_cfr import DeepCFR
+        # Check available frameworks
+        self.supported_frameworks = []
+        if TORCH_AVAILABLE:
+            self.supported_frameworks.append("pytorch")
+        if TF_AVAILABLE:
+            self.supported_frameworks.append("tensorflow")
         
-        # Load the value network
-        model_path = metadata.get('model_path')
-        if not model_path or not os.path.exists(model_path):
-            raise FileNotFoundError(f"Value network model not found at {model_path}")
-        
-        value_network, model_metadata = load_model(model_path)
-        
-        # Create a new DeepCFR instance
-        algorithm_state = metadata.get('algorithm_state', {})
-        agent = DeepCFR(
-            value_network=value_network,
-            input_dim=model_metadata.get('input_dim', 128),
-            action_dim=model_metadata.get('action_dim', 5),
-            game_type=model_metadata.get('game_type', 'spingo'),
-            num_players=model_metadata.get('num_players', 3),
-            memory_size=algorithm_state.get('memory_size', 10000),
-            batch_size=algorithm_state.get('batch_size', 128)
-        )
-        
-        # Restore algorithm state
-        agent.iteration = algorithm_state.get('iteration', 0)
-        agent.advantage_losses = algorithm_state.get('advantage_losses', [])
+        if not self.supported_frameworks:
+            logger.warning("No supported machine learning frameworks found")
     
-    elif agent_type == 'ppo':
-        from pokersim.algorithms.ppo import PPO
+    def save_model(self, model: Any, model_name: str, framework: str, 
+                 metadata: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Save a machine learning model and its metadata.
         
-        # Load the policy network
-        model_path = metadata.get('model_path')
-        if not model_path or not os.path.exists(model_path):
-            raise FileNotFoundError(f"Policy network model not found at {model_path}")
+        Args:
+            model (Any): Model to save (PyTorch or TensorFlow model).
+            model_name (str): Name of the model.
+            framework (str): Framework used by the model ('pytorch' or 'tensorflow').
+            metadata (Optional[Dict[str, Any]], optional): Model metadata. Defaults to None.
         
-        policy_network, model_metadata = load_model(model_path)
+        Returns:
+            str: Path to the saved model.
+        """
+        if framework.lower() not in self.supported_frameworks:
+            logger.error(f"Unsupported framework: {framework}")
+            return ""
         
-        # Create optimizer for the policy network
-        optimizer = torch.optim.Adam(policy_network.parameters(), lr=0.0001)
+        # Create model directory
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        model_dir = os.path.join(self.save_dir, f"{model_name}_{timestamp}")
+        os.makedirs(model_dir, exist_ok=True)
         
-        # Create a new PPO instance
-        algorithm_state = metadata.get('algorithm_state', {})
-        agent = PPO(
-            model=policy_network,
-            optimizer=optimizer,
-            game_type=model_metadata.get('game_type', 'spingo'),
-            num_players=model_metadata.get('num_players', 3),
-            clip_ratio=algorithm_state.get('clip_ratio', 0.2),
-            value_coef=algorithm_state.get('value_coef', 0.5),
-            entropy_coef=algorithm_state.get('entropy_coef', 0.01),
-            batch_size=algorithm_state.get('batch_size', 64),
-            gae_lambda=algorithm_state.get('gae_lambda', 0.95),
-            gamma=algorithm_state.get('gamma', 0.99)
-        )
+        # Save model based on framework
+        if framework.lower() == "pytorch" and TORCH_AVAILABLE:
+            model_path = self._save_pytorch_model(model, model_dir)
+        elif framework.lower() == "tensorflow" and TF_AVAILABLE:
+            model_path = self._save_tensorflow_model(model, model_dir)
+        else:
+            logger.error(f"Framework {framework} is not available")
+            return ""
         
-        # Restore algorithm state
-        agent.episode = algorithm_state.get('episode', 0)
-        agent.policy_losses = algorithm_state.get('policy_losses', [])
-        agent.value_losses = algorithm_state.get('value_losses', [])
-        agent.entropy_losses = algorithm_state.get('entropy_losses', [])
+        # Prepare metadata
+        if metadata is None:
+            metadata = {}
+        
+        metadata.update({
+            "model_name": model_name,
+            "framework": framework,
+            "timestamp": timestamp,
+            "save_path": model_path,
+        })
+        
+        # Save metadata
+        metadata_path = os.path.join(model_dir, "metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Saved {framework} model {model_name} to {model_dir}")
+        return model_dir
     
-    else:
-        raise ValueError(f"Unsupported agent type: {agent_type}")
-    
-    return agent
-
-
-def list_saved_models(directory: str) -> Dict[str, Any]:
-    """
-    List all saved models in a directory.
-    
-    Args:
-        directory (str): Directory to search for saved models.
-    
-    Returns:
-        Dict[str, Any]: Dictionary of model files and their metadata.
-    """
-    result = {}
-    
-    if not os.path.exists(directory):
-        return result
-    
-    for filename in os.listdir(directory):
-        if filename.endswith(".pt"):
-            path = os.path.join(directory, filename)
-            json_path = path + '.json'
+    def load_model(self, model_path: str) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Load a machine learning model and its metadata.
+        
+        Args:
+            model_path (str): Path to the model directory or file.
+        
+        Returns:
+            Tuple[Any, Dict[str, Any]]: Tuple of (model, metadata).
+        """
+        # Determine if path is a directory or file
+        if os.path.isdir(model_path):
+            # It's a directory, look for metadata
+            metadata_path = os.path.join(model_path, "metadata.json")
+            if not os.path.exists(metadata_path):
+                logger.error(f"No metadata found in {model_path}")
+                return None, {}
             
-            if os.path.exists(json_path):
-                # Read metadata
-                with open(json_path, 'r') as f:
-                    metadata = json.load(f)
-                
-                result[filename] = metadata
-    
-    return result
-
-
-def list_saved_agents(directory: str) -> Dict[str, Any]:
-    """
-    List all saved agents in a directory.
-    
-    Args:
-        directory (str): Directory to search for saved agents.
-    
-    Returns:
-        Dict[str, Any]: Dictionary of agent files and their metadata.
-    """
-    result = {}
-    
-    if not os.path.exists(directory):
-        return result
-    
-    for filename in os.listdir(directory):
-        if filename.endswith("_metadata.json"):
-            path = os.path.join(directory, filename)
-            
-            # Read metadata
-            with open(path, 'r') as f:
+            # Load metadata
+            with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
             
-            result[filename.replace("_metadata.json", "")] = metadata
+            # Determine framework and load model
+            framework = metadata.get("framework", "").lower()
+            if framework == "pytorch" and TORCH_AVAILABLE:
+                model = self._load_pytorch_model(model_path, metadata)
+            elif framework == "tensorflow" and TF_AVAILABLE:
+                model = self._load_tensorflow_model(model_path, metadata)
+            else:
+                logger.error(f"Unsupported or unavailable framework: {framework}")
+                return None, metadata
+        
+        else:
+            # It's a file, try to determine the type
+            _, ext = os.path.splitext(model_path)
+            
+            if ext == ".pt" and TORCH_AVAILABLE:
+                # PyTorch model
+                model = self._load_pytorch_model(model_path)
+                metadata = {"framework": "pytorch", "save_path": model_path}
+            
+            elif (ext == ".h5" or ext == ".keras") and TF_AVAILABLE:
+                # TensorFlow model
+                model = self._load_tensorflow_model(model_path)
+                metadata = {"framework": "tensorflow", "save_path": model_path}
+            
+            elif ext == ".pkl":
+                # Pickle file, could be anything
+                try:
+                    with open(model_path, 'rb') as f:
+                        model = pickle.load(f)
+                    metadata = {"framework": "pickle", "save_path": model_path}
+                except Exception as e:
+                    logger.error(f"Error loading pickle file: {e}")
+                    return None, {}
+            
+            else:
+                logger.error(f"Unsupported model file: {model_path}")
+                return None, {}
+        
+        logger.info(f"Loaded model from {model_path}")
+        return model, metadata
     
-    return result
+    def _save_pytorch_model(self, model: Any, model_dir: str) -> str:
+        """
+        Save a PyTorch model.
+        
+        Args:
+            model (Any): PyTorch model to save.
+            model_dir (str): Directory to save the model in.
+        
+        Returns:
+            str: Path to the saved model.
+        """
+        model_path = os.path.join(model_dir, "model.pt")
+        torch.save(model.state_dict(), model_path)
+        
+        # Also save model architecture if available
+        if hasattr(model, "get_config"):
+            config_path = os.path.join(model_dir, "architecture.json")
+            with open(config_path, 'w') as f:
+                json.dump(model.get_config(), f, indent=2)
+        
+        return model_path
+    
+    def _save_tensorflow_model(self, model: Any, model_dir: str) -> str:
+        """
+        Save a TensorFlow model.
+        
+        Args:
+            model (Any): TensorFlow model to save.
+            model_dir (str): Directory to save the model in.
+        
+        Returns:
+            str: Path to the saved model.
+        """
+        model_path = os.path.join(model_dir, "model.keras")
+        model.save(model_path)
+        return model_path
+    
+    def _load_pytorch_model(self, model_path: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Load a PyTorch model.
+        
+        Args:
+            model_path (str): Path to the model file or directory.
+            metadata (Optional[Dict[str, Any]], optional): Model metadata. Defaults to None.
+        
+        Returns:
+            Any: Loaded PyTorch model.
+        """
+        if os.path.isdir(model_path):
+            # Look for model file in directory
+            model_file = os.path.join(model_path, "model.pt")
+            if not os.path.exists(model_file):
+                logger.error(f"No PyTorch model found in {model_path}")
+                return None
+        else:
+            model_file = model_path
+        
+        # Load model architecture if available
+        if metadata and "model_class" in metadata:
+            model_class = metadata["model_class"]
+            # This would require dynamic import, which is complex
+            # For simplicity, we'll return the state dict and let the caller handle it
+            state_dict = torch.load(model_file, map_location=torch.device('cpu'))
+            return state_dict
+        else:
+            # Just load the state dict
+            state_dict = torch.load(model_file, map_location=torch.device('cpu'))
+            return state_dict
+    
+    def _load_tensorflow_model(self, model_path: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Load a TensorFlow model.
+        
+        Args:
+            model_path (str): Path to the model file or directory.
+            metadata (Optional[Dict[str, Any]], optional): Model metadata. Defaults to None.
+        
+        Returns:
+            Any: Loaded TensorFlow model.
+        """
+        if os.path.isdir(model_path):
+            # Look for model file in directory
+            model_file = os.path.join(model_path, "model.keras")
+            if not os.path.exists(model_file):
+                # Try older format
+                model_file = os.path.join(model_path, "model.h5")
+                if not os.path.exists(model_file):
+                    logger.error(f"No TensorFlow model found in {model_path}")
+                    return None
+        else:
+            model_file = model_path
+        
+        # Load the model
+        model = tf.keras.models.load_model(model_file)
+        return model
+    
+    def list_models(self) -> List[Dict[str, Any]]:
+        """
+        List all saved models.
+        
+        Returns:
+            List[Dict[str, Any]]: List of model metadata.
+        """
+        models = []
+        
+        # Check if save directory exists
+        if not os.path.exists(self.save_dir):
+            logger.warning(f"Save directory {self.save_dir} does not exist")
+            return models
+        
+        # Iterate through subdirectories
+        for model_dir in os.listdir(self.save_dir):
+            dir_path = os.path.join(self.save_dir, model_dir)
+            
+            if not os.path.isdir(dir_path):
+                continue
+            
+            # Look for metadata
+            metadata_path = os.path.join(dir_path, "metadata.json")
+            if os.path.exists(metadata_path):
+                try:
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    
+                    # Add directory path
+                    metadata["directory"] = dir_path
+                    models.append(metadata)
+                
+                except Exception as e:
+                    logger.warning(f"Error loading metadata from {metadata_path}: {e}")
+        
+        return models
+    
+    def get_latest_model(self, model_name: str) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Get the latest version of a model by name.
+        
+        Args:
+            model_name (str): Name of the model.
+        
+        Returns:
+            Tuple[Any, Dict[str, Any]]: Tuple of (model, metadata).
+        """
+        models = self.list_models()
+        
+        # Filter by model name
+        matching_models = [m for m in models if m.get("model_name") == model_name]
+        
+        if not matching_models:
+            logger.warning(f"No models found with name {model_name}")
+            return None, {}
+        
+        # Sort by timestamp
+        matching_models.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
+        
+        # Load the latest model
+        latest_model = matching_models[0]
+        model_dir = latest_model["directory"]
+        
+        return self.load_model(model_dir)
+
+
+# Singleton instance
+_instance = None
+
+def get_model_io() -> ModelIO:
+    """
+    Get the singleton model I/O instance.
+    
+    Returns:
+        ModelIO: Model I/O instance.
+    """
+    global _instance
+    if _instance is None:
+        _instance = ModelIO()
+    return _instance

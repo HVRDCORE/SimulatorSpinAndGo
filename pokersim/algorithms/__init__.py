@@ -1,12 +1,10 @@
 """
-Algorithms module for poker reinforcement learning.
+Algorithms package for the poker simulator.
 
-This module includes implementations of algorithms for training 
-poker agents, such as Deep Counterfactual Regret Minimization (Deep CFR)
-and Proximal Policy Optimization (PPO).
+This package provides implementations of various poker algorithms, including:
+- Counterfactual Regret Minimization (CFR)
+- Deep Counterfactual Regret Minimization (Deep CFR)
+- Monte Carlo Tree Search (MCTS)
+- Proximal Policy Optimization (PPO)
+- Neural Fictitious Self-Play (NFSP)
 """
-
-from pokersim.algorithms.deep_cfr import DeepCFR
-from pokersim.algorithms.ppo import PPO
-
-__all__ = ["DeepCFR", "PPO"]

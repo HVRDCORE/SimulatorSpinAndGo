@@ -1,13 +1,7 @@
 """
-Machine learning module for poker simulations.
+Machine learning package for the poker simulator.
 
-This module integrates with machine learning frameworks like PyTorch and
-TensorFlow, and provides models and agents for poker simulations.
+This package provides integration with various machine learning frameworks, 
+including PyTorch and TensorFlow, for training and using poker agents.
+It includes model definitions, training utilities, and GPU optimization.
 """
-
-from pokersim.ml.models import PokerCNN, PokerMLP
-from pokersim.ml.agents import MLAgent, TorchAgent, RandomMLAgent
-
-__all__ = [
-    "PokerCNN", "PokerMLP", "MLAgent", "TorchAgent", "RandomMLAgent"
-]

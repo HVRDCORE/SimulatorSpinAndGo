@@ -1,460 +1,424 @@
 """
-Implementation of Counterfactual Regret Minimization (CFR) algorithm for poker.
+Counterfactual Regret Minimization (CFR) algorithm for the poker simulator.
 
-This module provides a general-purpose implementation of the CFR algorithm
-for computing approximate Nash equilibrium strategies in extensive-form games
-like poker. CFR is one of the most successful algorithms for solving large
-imperfect information games.
+This module implements the vanilla CFR algorithm for solving imperfect
+information games like poker. It includes functionality for computing
+Nash equilibrium strategies through iterative self-play.
 """
 
+import os
+import logging
+import json
 import numpy as np
+from typing import Dict, List, Any, Optional, Union, Tuple, Set, Callable
+import time
 import random
-from typing import Dict, List, Tuple, Set, Any, Optional
 from collections import defaultdict
 
-from pokersim.game.state import GameState
-from pokersim.game.spingo import SpinGoGame
+from pokersim.config.config_manager import get_config
+from pokersim.logging.game_logger import get_logger
+
+# Configure logging
+logger = logging.getLogger("pokersim.algorithms.cfr")
 
 
-class InformationSet:
+class CFRSolver:
     """
-    Information set for a player in an imperfect information game.
+    Counterfactual Regret Minimization (CFR) solver for poker games.
     
-    An information set represents states that are indistinguishable to a player
-    due to hidden information (e.g., opponent's cards in poker).
+    This class implements vanilla CFR for computing approximate Nash equilibrium
+    strategies in extensive-form games like poker. It tracks regrets and strategies
+    for each information set and updates them through iterative self-play.
     
     Attributes:
-        key (str): Unique identifier for this information set.
-        num_actions (int): Number of available actions in this information set.
-        regret_sum (np.ndarray): Accumulated regrets for each action.
-        strategy_sum (np.ndarray): Accumulated strategy probabilities for each action.
-        current_strategy (np.ndarray): Current strategy probabilities.
+        config (Dict[str, Any]): Configuration settings.
+        game_logger: Game logger instance.
+        info_sets (Dict[str, Dict]): Information sets with regrets and strategies.
+        iterations (int): Number of iterations performed.
+        game_state_class: Class for the game state (e.g., PokerState).
     """
     
-    def __init__(self, key: str, num_actions: int):
+    def __init__(self, game_state_class: Any):
         """
-        Initialize an information set.
+        Initialize the CFR solver.
         
         Args:
-            key (str): Unique identifier for this information set.
-            num_actions (int): Number of available actions in this information set.
+            game_state_class: Class for the game state.
         """
-        self.key = key
-        self.num_actions = num_actions
-        self.regret_sum = np.zeros(num_actions)
-        self.strategy_sum = np.zeros(num_actions)
-        self.current_strategy = np.zeros(num_actions)
+        # Get configuration
+        config = get_config()
+        self.config = config.to_dict()
         
-        # Initialize to uniform strategy
-        self.current_strategy.fill(1.0 / num_actions)
+        # Set up logging
+        self.game_logger = get_logger()
+        
+        # Initialize solver state
+        self.info_sets = {}  # Information set -> {regrets, strategy, cumulative_strategy}
+        self.iterations = 0
+        self.game_state_class = game_state_class
     
-    def get_strategy(self, reach_prob: float) -> np.ndarray:
+    def get_strategy(self, info_set_key: str, num_actions: int) -> np.ndarray:
         """
-        Get the current strategy for this information set.
+        Get current strategy for an information set.
         
         Args:
-            reach_prob (float): The probability of reaching this information set.
+            info_set_key (str): Information set key.
+            num_actions (int): Number of possible actions.
         
         Returns:
-            np.ndarray: Strategy probabilities for each action.
+            np.ndarray: Probability distribution over actions.
         """
-        # Calculate strategy using regret matching
-        strategy = np.maximum(self.regret_sum, 0)
-        total = np.sum(strategy)
+        # Create information set if it doesn't exist
+        if info_set_key not in self.info_sets:
+            self.info_sets[info_set_key] = {
+                "regrets": np.zeros(num_actions),
+                "strategy": np.ones(num_actions) / num_actions,  # Uniform initial strategy
+                "cumulative_strategy": np.zeros(num_actions)
+            }
         
-        if total > 0:
-            strategy /= total
+        # Get information set data
+        info_set = self.info_sets[info_set_key]
+        
+        # Compute strategy from regrets using Regret Matching
+        regrets = np.maximum(0, info_set["regrets"])  # Only consider positive regrets
+        regret_sum = np.sum(regrets)
+        
+        if regret_sum > 0:
+            # Normalize regrets to get strategy
+            strategy = regrets / regret_sum
         else:
-            # If all regrets are non-positive, use uniform strategy
-            strategy.fill(1.0 / self.num_actions)
+            # Use uniform strategy if all regrets are non-positive
+            strategy = np.ones(num_actions) / num_actions
         
-        # Accumulate the strategy weighted by reach probability
-        self.strategy_sum += reach_prob * strategy
-        self.current_strategy = strategy
+        # Update strategy in the information set
+        info_set["strategy"] = strategy
         
         return strategy
     
-    def get_average_strategy(self) -> np.ndarray:
+    def update_cumulative_strategy(self, info_set_key: str, strategy: np.ndarray, 
+                                  reach_prob: float):
         """
-        Get the average strategy over all iterations.
+        Update cumulative strategy for an information set.
+        
+        Args:
+            info_set_key (str): Information set key.
+            strategy (np.ndarray): Current strategy.
+            reach_prob (float): Reach probability for the player.
+        """
+        self.info_sets[info_set_key]["cumulative_strategy"] += reach_prob * strategy
+    
+    def get_average_strategy(self, info_set_key: str) -> np.ndarray:
+        """
+        Get average strategy for an information set.
+        
+        The average strategy approaches a Nash equilibrium as the number of
+        iterations increases.
+        
+        Args:
+            info_set_key (str): Information set key.
         
         Returns:
-            np.ndarray: Average strategy probabilities for each action.
+            np.ndarray: Average strategy (probability distribution over actions).
         """
-        avg_strategy = np.zeros(self.num_actions)
-        total = np.sum(self.strategy_sum)
+        if info_set_key not in self.info_sets:
+            return None
+        
+        cumulative_strategy = self.info_sets[info_set_key]["cumulative_strategy"]
+        total = np.sum(cumulative_strategy)
         
         if total > 0:
-            avg_strategy = self.strategy_sum / total
+            return cumulative_strategy / total
         else:
-            # If no accumulated strategy, use uniform
-            avg_strategy.fill(1.0 / self.num_actions)
-        
-        return avg_strategy
+            # Uniform strategy if no cumulative strategy
+            return np.ones(len(cumulative_strategy)) / len(cumulative_strategy)
     
-    def update_regrets(self, action_utils: np.ndarray, node_util: float) -> None:
+    def update_regrets(self, info_set_key: str, action_regrets: np.ndarray):
         """
-        Update the accumulated regrets.
+        Update regrets for an information set.
         
         Args:
-            action_utils (np.ndarray): Utility of each action.
-            node_util (float): Actual utility of the node.
+            info_set_key (str): Information set key.
+            action_regrets (np.ndarray): Regrets for each action.
         """
-        self.regret_sum += action_utils - node_util
-
-
-class CFR:
-    """
-    Counterfactual Regret Minimization algorithm.
+        self.info_sets[info_set_key]["regrets"] += action_regrets
     
-    This class implements the CFR algorithm for computing approximate Nash
-    equilibrium strategies in extensive-form games like poker.
-    
-    Attributes:
-        game_type (str): Type of game ('holdem', 'spingo', etc.).
-        num_players (int): Number of players in the game.
-        info_sets (Dict[str, InformationSet]): Information sets for all players.
-        iterations (int): Number of iterations performed.
-    """
-    
-    def __init__(self, game_type: str = 'spingo', num_players: int = 3):
+    def cfr(self, state: Any, reach_probs: List[float]) -> float:
         """
-        Initialize the CFR algorithm.
+        Run Counterfactual Regret Minimization recursively on a game state.
         
         Args:
-            game_type (str, optional): Type of game. Defaults to 'spingo'.
-            num_players (int, optional): Number of players. Defaults to 3.
+            state: Current game state.
+            reach_probs (List[float]): Reach probabilities for each player.
+        
+        Returns:
+            float: Expected value for the active player.
         """
-        self.game_type = game_type
-        self.num_players = num_players
-        self.info_sets = {}  # Maps info set keys to InformationSet objects
-        self.iterations = 0
+        # Return terminal utility
+        if state.is_terminal():
+            return state.get_utility()
+        
+        # Return expected value for chance nodes
+        if state.is_chance_node():
+            outcomes = state.get_chance_outcomes()
+            expected_value = 0.0
+            
+            for action, prob in outcomes:
+                next_state = state.apply_action(action)
+                expected_value += prob * self.cfr(next_state, reach_probs)
+            
+            return expected_value
+        
+        # Get current player and information set
+        player = state.get_current_player()
+        info_set_key = state.get_info_set_key()
+        legal_actions = state.get_legal_actions()
+        num_actions = len(legal_actions)
+        
+        # Get strategy for this information set
+        strategy = self.get_strategy(info_set_key, num_actions)
+        
+        # Update cumulative strategy
+        self.update_cumulative_strategy(info_set_key, strategy, reach_probs[player])
+        
+        # Recursively call CFR for each action and compute expected value
+        action_values = np.zeros(num_actions)
+        
+        for i, action in enumerate(legal_actions):
+            # Create new reach probabilities with this action
+            new_reach_probs = reach_probs.copy()
+            new_reach_probs[player] *= strategy[i]
+            
+            # Apply action and recurse
+            next_state = state.apply_action(action)
+            action_values[i] = self.cfr(next_state, new_reach_probs)
+        
+        # Compute counterfactual value
+        cf_value = np.sum(strategy * action_values)
+        
+        # Compute counterfactual regrets
+        regrets = action_values - cf_value
+        
+        # Update regrets scaled by counterfactual reach probability
+        cf_reach_prob = np.prod(reach_probs) / reach_probs[player]  # Reach probability of other players
+        self.update_regrets(info_set_key, regrets * cf_reach_prob)
+        
+        return cf_value
     
-    def train(self, num_iterations: int = 1000, pruning: bool = True) -> None:
+    def train(self, num_iterations: int, callback: Optional[Callable] = None) -> Dict[str, Any]:
         """
-        Run CFR training for a specified number of iterations.
+        Train the CFR solver for a specified number of iterations.
         
         Args:
-            num_iterations (int, optional): Number of iterations. Defaults to 1000.
-            pruning (bool, optional): Whether to use pruning. Defaults to True.
+            num_iterations (int): Number of iterations to run.
+            callback (Optional[Callable], optional): Callback function called
+                after each iteration. Defaults to None.
+        
+        Returns:
+            Dict[str, Any]: Training results.
         """
-        utility = 0.0
+        start_time = time.time()
+        metrics = []
         
         for i in range(num_iterations):
-            # Create a new game state
-            if self.game_type == 'spingo':
-                game = SpinGoGame(num_players=self.num_players)
-                game_state = game.start_new_hand()
-            else:
-                game_state = GameState(num_players=self.num_players)
-                game_state.deal_hole_cards()
+            # Initialize game state
+            initial_state = self.game_state_class()
             
-            # Run CFR for each player
-            for p in range(self.num_players):
-                # Initialize reach probabilities
-                reach_probs = np.ones(self.num_players)
-                
-                if pruning:
-                    utility += self._cfr_with_pruning(game_state, p, reach_probs)
-                else:
-                    utility += self._cfr(game_state, p, reach_probs)
+            # Determine initial reach probabilities
+            num_players = initial_state.get_num_players()
+            reach_probs = [1.0] * num_players
             
+            # Run CFR
+            utility = self.cfr(initial_state, reach_probs)
+            
+            # Update iteration counter
             self.iterations += 1
             
-            # Optionally print progress
-            if (i + 1) % 100 == 0:
-                print(f"Completed {i + 1} iterations, average game value: {utility / (i + 1)}")
+            # Log progress
+            if (i + 1) % max(1, num_iterations // 10) == 0:
+                elapsed = time.time() - start_time
+                exploitability = self.compute_exploitability() if hasattr(self, "compute_exploitability") else None
+                
+                logger.info(f"Iteration {i+1}/{num_iterations} - Utility: {utility:.6f}" + 
+                           (f" - Exploitability: {exploitability:.6f}" if exploitability is not None else ""))
+                
+                # Record metrics
+                metric = {
+                    "iteration": i + 1,
+                    "utility": float(utility),
+                    "time": elapsed
+                }
+                
+                if exploitability is not None:
+                    metric["exploitability"] = float(exploitability)
+                
+                metrics.append(metric)
+                
+                # Log to game logger
+                self.game_logger.log_training_metrics("CFR", metric, i + 1)
+            
+            # Call callback if provided
+            if callback is not None:
+                callback(i, utility, self)
+        
+        total_time = time.time() - start_time
+        logger.info(f"CFR training completed in {total_time:.2f} seconds")
+        
+        # Return results
+        return {
+            "algorithm": "CFR",
+            "iterations": num_iterations,
+            "total_time": total_time,
+            "info_sets_count": len(self.info_sets),
+            "metrics": metrics
+        }
     
-    def _cfr(self, game_state: GameState, traverser: int, reach_probs: np.ndarray) -> float:
+    def save(self, filepath: Optional[str] = None) -> str:
         """
-        Run one iteration of the CFR algorithm.
+        Save the CFR solver state to a file.
         
         Args:
-            game_state (GameState): Current game state.
-            traverser (int): Player ID of the traverser.
-            reach_probs (np.ndarray): Reach probabilities for each player.
+            filepath (Optional[str], optional): Path to save the state. Defaults to None.
         
         Returns:
-            float: Expected utility for the traverser.
+            str: Path to the saved file.
         """
-        # Return payoff at terminal states
-        if game_state.is_terminal():
-            return game_state.get_utility(traverser)
+        if filepath is None:
+            # Generate default filepath
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filepath = os.path.join(self.config["agents"]["save_dir"], f"cfr_model_{timestamp}.json")
         
-        current_player = game_state.current_player
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
-        # Chance node (e.g., dealing cards)
-        if current_player == -1:  # Convention for chance player
-            outcome_probs = game_state.get_chance_probabilities()
-            utility = 0.0
-            
-            for outcome, prob in outcome_probs.items():
-                next_state = game_state.apply_chance_outcome(outcome)
-                utility += prob * self._cfr(next_state, traverser, reach_probs)
-            
-            return utility
-        
-        # Get information set key for the current player
-        info_set_key = self._get_info_set_key(game_state, current_player)
-        legal_actions = game_state.get_legal_actions()
-        num_actions = len(legal_actions)
-        
-        # Create a new information set if we haven't seen this one before
-        if info_set_key not in self.info_sets:
-            self.info_sets[info_set_key] = InformationSet(info_set_key, num_actions)
-        
-        info_set = self.info_sets[info_set_key]
-        
-        # Get strategy for this information set
-        strategy = info_set.get_strategy(reach_probs[current_player])
-        
-        # Compute utility for each action
-        action_utils = np.zeros(num_actions)
-        
-        for a, action in enumerate(legal_actions):
-            # Create new reach probabilities
-            new_reach_probs = reach_probs.copy()
-            new_reach_probs[current_player] *= strategy[a]
-            
-            # Recursive call
-            next_state = game_state.apply_action(action)
-            action_utils[a] = self._cfr(next_state, traverser, new_reach_probs)
-        
-        # Compute expected utility
-        node_util = np.sum(strategy * action_utils)
-        
-        # Update regrets if this is the traversing player
-        if current_player == traverser:
-            # Calculate counterfactual regrets
-            info_set.update_regrets(action_utils, node_util)
-        
-        return node_util
-    
-    def _cfr_with_pruning(self, game_state: GameState, traverser: int, 
-                         reach_probs: np.ndarray) -> float:
-        """
-        Run one iteration of CFR with regret-based pruning.
-        
-        This version of CFR skips updating paths that are unlikely to be reached,
-        which can significantly speed up the algorithm.
-        
-        Args:
-            game_state (GameState): Current game state.
-            traverser (int): Player ID of the traverser.
-            reach_probs (np.ndarray): Reach probabilities for each player.
-        
-        Returns:
-            float: Expected utility for the traverser.
-        """
-        # Return payoff at terminal states
-        if game_state.is_terminal():
-            return game_state.get_utility(traverser)
-        
-        current_player = game_state.current_player
-        
-        # Chance node (e.g., dealing cards)
-        if current_player == -1:  # Convention for chance player
-            outcome_probs = game_state.get_chance_probabilities()
-            utility = 0.0
-            
-            for outcome, prob in outcome_probs.items():
-                next_state = game_state.apply_chance_outcome(outcome)
-                utility += prob * self._cfr_with_pruning(next_state, traverser, reach_probs)
-            
-            return utility
-        
-        # Check if we can prune this subtree
-        if current_player != traverser:
-            # Calculate probability of reaching this node for the traverser
-            traverser_reach = reach_probs[traverser]
-            
-            # Prune if the probability is too low
-            if traverser_reach < 1e-8:  # Pruning threshold
-                return 0.0
-        
-        # Get information set key for the current player
-        info_set_key = self._get_info_set_key(game_state, current_player)
-        legal_actions = game_state.get_legal_actions()
-        num_actions = len(legal_actions)
-        
-        # Create a new information set if we haven't seen this one before
-        if info_set_key not in self.info_sets:
-            self.info_sets[info_set_key] = InformationSet(info_set_key, num_actions)
-        
-        info_set = self.info_sets[info_set_key]
-        
-        # Get strategy for this information set
-        strategy = info_set.get_strategy(reach_probs[current_player])
-        
-        # Compute utility for each action
-        action_utils = np.zeros(num_actions)
-        
-        for a, action in enumerate(legal_actions):
-            # Skip actions with very low probability for non-traversers
-            if current_player != traverser and strategy[a] < 1e-8:
-                continue
-            
-            # Create new reach probabilities
-            new_reach_probs = reach_probs.copy()
-            new_reach_probs[current_player] *= strategy[a]
-            
-            # Recursive call
-            next_state = game_state.apply_action(action)
-            action_utils[a] = self._cfr_with_pruning(next_state, traverser, new_reach_probs)
-        
-        # Compute expected utility
-        node_util = np.sum(strategy * action_utils)
-        
-        # Update regrets if this is the traversing player
-        if current_player == traverser:
-            # Calculate counterfactual regrets
-            info_set.update_regrets(action_utils, node_util)
-        
-        return node_util
-    
-    def _get_info_set_key(self, game_state: GameState, player_id: int) -> str:
-        """
-        Generate a unique key for an information set.
-        
-        This key should encapsulate all information visible to the player.
-        
-        Args:
-            game_state (GameState): Current game state.
-            player_id (int): Player ID.
-        
-        Returns:
-            str: A unique identifier for the information set.
-        """
-        # This is a simplified implementation - in practice, you would want
-        # to include all visible information:
-        #   - Player's hole cards
-        #   - Community cards
-        #   - Betting history
-        #   - Player positions
-        
-        # Get visible cards
-        visible_cards = []
-        
-        if hasattr(game_state, 'hole_cards') and game_state.hole_cards:
-            if player_id in game_state.hole_cards:
-                visible_cards.extend(sorted(game_state.hole_cards[player_id]))
-        
-        if hasattr(game_state, 'community_cards') and game_state.community_cards:
-            visible_cards.extend(sorted(game_state.community_cards))
-        
-        # Get betting history
-        betting_history = []
-        if hasattr(game_state, 'betting_history'):
-            betting_history = game_state.betting_history
-        
-        # Combine all information into a string
-        key_parts = [
-            f"P{player_id}",
-            f"Cards:{'-'.join(str(c) for c in visible_cards)}",
-            f"History:{'-'.join(str(a) for a in betting_history)}",
-            f"Stage:{game_state.stage if hasattr(game_state, 'stage') else 'Unknown'}"
-        ]
-        
-        return "|".join(key_parts)
-    
-    def get_strategy(self, game_state: GameState, player_id: int) -> Dict[Any, float]:
-        """
-        Get the strategy for a player in a given game state.
-        
-        Args:
-            game_state (GameState): Current game state.
-            player_id (int): Player ID.
-        
-        Returns:
-            Dict[Any, float]: Mapping from actions to probabilities.
-        """
-        # Get information set key
-        info_set_key = self._get_info_set_key(game_state, player_id)
-        
-        # If we haven't seen this information set, return uniform strategy
-        if info_set_key not in self.info_sets:
-            legal_actions = game_state.get_legal_actions()
-            probs = np.ones(len(legal_actions)) / len(legal_actions)
-            return {action: prob for action, prob in zip(legal_actions, probs)}
-        
-        # Get the average strategy for this information set
-        info_set = self.info_sets[info_set_key]
-        avg_strategy = info_set.get_average_strategy()
-        
-        # Map strategy probabilities to actions
-        legal_actions = game_state.get_legal_actions()
-        return {action: prob for action, prob in zip(legal_actions, avg_strategy)}
-    
-    def act(self, game_state: GameState, player_id: int) -> Any:
-        """
-        Choose an action using the learned strategy.
-        
-        Args:
-            game_state (GameState): Current game state.
-            player_id (int): Player ID.
-        
-        Returns:
-            Any: The chosen action.
-        """
-        # Get strategy for this state
-        strategy = self.get_strategy(game_state, player_id)
-        
-        # Get legal actions and their probabilities
-        actions = list(strategy.keys())
-        probs = list(strategy.values())
-        
-        # Choose an action according to the strategy
-        return np.random.choice(actions, p=probs)
-    
-    def evaluate(self, num_games: int = 100, opponent_type: str = 'rule_based') -> Dict[str, Any]:
-        """
-        Evaluate the agent against opponents.
-        
-        Args:
-            num_games (int, optional): Number of games to play. Defaults to 100.
-            opponent_type (str, optional): Type of opponents. Defaults to 'rule_based'.
-            
-        Returns:
-            Dict[str, Any]: Evaluation metrics.
-        """
-        # Placeholder for evaluation logic
-        results = {
-            'win_rate': 0.0,
-            'avg_utility': 0.0,
-            'games_played': num_games
+        # Prepare data for saving
+        data = {
+            "algorithm": "CFR",
+            "iterations": self.iterations,
+            "timestamp": time.time(),
+            "info_sets": {}
         }
         
-        return results
-
-
-class CFRPlayer:
-    """
-    Player that uses CFR to make decisions.
+        # Convert information sets to serializable format
+        for info_set_key, info_set in self.info_sets.items():
+            data["info_sets"][info_set_key] = {
+                "regrets": info_set["regrets"].tolist(),
+                "strategy": info_set["strategy"].tolist(),
+                "cumulative_strategy": info_set["cumulative_strategy"].tolist()
+            }
+        
+        # Save to file
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        logger.info(f"Saved CFR model to {filepath}")
+        return filepath
     
-    Attributes:
-        player_id (int): Player ID.
-        cfr (CFR): CFR algorithm instance.
-    """
-    
-    def __init__(self, player_id: int, cfr: CFR):
+    def load(self, filepath: str) -> bool:
         """
-        Initialize CFR player.
+        Load the CFR solver state from a file.
         
         Args:
-            player_id (int): Player ID.
-            cfr (CFR): Trained CFR instance.
-        """
-        self.player_id = player_id
-        self.cfr = cfr
-    
-    def act(self, game_state: GameState) -> Any:
-        """
-        Choose an action using CFR.
-        
-        Args:
-            game_state (GameState): Current game state.
+            filepath (str): Path to the saved state.
         
         Returns:
-            Any: The chosen action.
+            bool: Whether the load was successful.
         """
-        return self.cfr.act(game_state, self.player_id)
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            
+            # Check algorithm
+            if data.get("algorithm") != "CFR":
+                logger.error(f"Invalid algorithm in {filepath}, expected CFR")
+                return False
+            
+            # Load iterations
+            self.iterations = data.get("iterations", 0)
+            
+            # Load information sets
+            self.info_sets = {}
+            for info_set_key, info_set in data.get("info_sets", {}).items():
+                self.info_sets[info_set_key] = {
+                    "regrets": np.array(info_set["regrets"]),
+                    "strategy": np.array(info_set["strategy"]),
+                    "cumulative_strategy": np.array(info_set["cumulative_strategy"])
+                }
+            
+            logger.info(f"Loaded CFR model from {filepath}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error loading CFR model from {filepath}: {e}")
+            return False
+    
+    def get_best_response(self, info_set_key: str) -> int:
+        """
+        Get the best response action for an information set.
+        
+        Args:
+            info_set_key (str): Information set key.
+        
+        Returns:
+            int: Best response action index.
+        """
+        if info_set_key not in self.info_sets:
+            # Return random action if information set not found
+            return 0
+        
+        # Get average strategy
+        strategy = self.get_average_strategy(info_set_key)
+        
+        # Return action with highest probability
+        return np.argmax(strategy)
+    
+    def compute_exploitability(self, num_samples: int = 1000) -> float:
+        """
+        Compute the exploitability of the current strategy.
+        
+        This is a simplified implementation that estimates exploitability
+        by sampling states. For a full implementation, see the CFR+ paper.
+        
+        Args:
+            num_samples (int, optional): Number of states to sample. Defaults to 1000.
+        
+        Returns:
+            float: Estimated exploitability.
+        """
+        # This is a simplified placeholder for exploitability computation
+        # A full implementation would require best response computation
+        # which is complex and depends on the specific game
+        
+        # For simplicity, we return a proxy measure based on regret
+        total_regret = 0.0
+        count = 0
+        
+        for info_set in self.info_sets.values():
+            regrets = np.maximum(0, info_set["regrets"])
+            if np.sum(regrets) > 0:
+                total_regret += np.max(regrets)
+                count += 1
+        
+        if count > 0:
+            return total_regret / (count * self.iterations)
+        else:
+            return 0.0
+    
+    def get_action_probabilities(self, state: Any) -> np.ndarray:
+        """
+        Get action probabilities for a given state.
+        
+        Args:
+            state: Game state.
+        
+        Returns:
+            np.ndarray: Probability distribution over actions.
+        """
+        info_set_key = state.get_info_set_key()
+        legal_actions = state.get_legal_actions()
+        num_actions = len(legal_actions)
+        
+        if info_set_key in self.info_sets:
+            return self.get_average_strategy(info_set_key)
+        else:
+            # Return uniform distribution if information set not found
+            return np.ones(num_actions) / num_actions

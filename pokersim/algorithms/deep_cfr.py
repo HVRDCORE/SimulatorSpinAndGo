@@ -1,386 +1,916 @@
 """
-Implementation of Deep Counterfactual Regret Minimization (Deep CFR).
+Deep Counterfactual Regret Minimization (Deep CFR) algorithm for the poker simulator.
 
-This module provides an implementation of the Deep CFR algorithm for learning
-approximate Nash equilibrium strategies in imperfect information games like poker.
-Deep CFR uses deep neural networks to approximate the advantages and strategy
-of the game.
+This module implements the Deep CFR algorithm, which uses neural networks to
+approximate the advantage functions in CFR, allowing for more efficient computation
+and better generalization across game states.
 """
 
-import random
+import os
+import logging
+import json
 import numpy as np
-from typing import List, Dict, Tuple, Any, Optional
-from collections import deque
-import torch
-import torch.nn as nn
-import torch.optim as optim
+from typing import Dict, List, Any, Optional, Union, Tuple, Set, Callable
+import time
+import random
+from collections import defaultdict, deque
 
-from pokersim.game.state import GameState
-from pokersim.game.spingo import SpinGoGame
+from pokersim.config.config_manager import get_config
+from pokersim.logging.game_logger import get_logger
+from pokersim.ml.model_io import get_model_io
+from pokersim.utils.gpu_optimization import optimize_tensor_for_gpu
+
+# Conditional imports for PyTorch and TensorFlow
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+# Configure logging
+logger = logging.getLogger("pokersim.algorithms.deep_cfr")
 
 
-class ReplayMemory:
+class DeepCFRSolver:
     """
-    Replay memory for storing advantage samples.
+    Deep Counterfactual Regret Minimization (Deep CFR) solver for poker games.
+    
+    This class implements Deep CFR, a variant of CFR that uses neural networks
+    to approximate the advantage functions, allowing for better scaling and
+    generalization. It maintains separate networks for each player's advantage
+    function and a policy network for the final strategy.
     
     Attributes:
-        capacity (int): Maximum size of the memory.
-        memory (deque): The internal storage.
+        config (Dict[str, Any]): Configuration settings.
+        game_logger: Game logger instance.
+        model_io: Model I/O manager.
+        game_state_class: Class for the game state.
+        advantage_networks (Dict[int, Any]): Advantage networks for each player.
+        strategy_network (Any): Strategy network (policy).
+        advantage_buffers (Dict[int, List]): Advantage memories for each player.
+        strategy_buffer (List): Strategy memory.
+        iterations (int): Number of iterations performed.
+        framework (str): Deep learning framework being used ('pytorch' or 'tensorflow').
     """
     
-    def __init__(self, capacity: int):
+    def __init__(self, game_state_class: Any, framework: str = "auto"):
         """
-        Initialize replay memory.
+        Initialize the Deep CFR solver.
         
         Args:
-            capacity (int): Maximum size of the memory.
+            game_state_class: Class for the game state.
+            framework (str, optional): Deep learning framework to use. Defaults to "auto".
         """
-        self.capacity = capacity
-        self.memory = deque(maxlen=capacity)
-    
-    def push(self, state: np.ndarray, advantage: float):
-        """
-        Add a sample to memory.
+        # Get configuration
+        config = get_config()
+        self.config = config.to_dict()
         
-        Args:
-            state (np.ndarray): State representation.
-            advantage (float): Advantage value.
-        """
-        self.memory.append((state, advantage))
-    
-    def sample(self, batch_size: int) -> List[Tuple[np.ndarray, float]]:
-        """
-        Sample a batch from memory.
+        # Set up logging and model I/O
+        self.game_logger = get_logger()
+        self.model_io = get_model_io()
         
-        Args:
-            batch_size (int): Size of the batch to sample.
-            
-        Returns:
-            List[Tuple[np.ndarray, float]]: Batch of samples.
-        """
-        return random.sample(self.memory, min(batch_size, len(self.memory)))
-    
-    def __len__(self) -> int:
-        """
-        Get the current size of the memory.
-        
-        Returns:
-            int: Number of samples in memory.
-        """
-        return len(self.memory)
-
-
-class DeepCFR:
-    """
-    Deep Counterfactual Regret Minimization algorithm.
-    
-    This class implements the Deep CFR algorithm for approximating Nash equilibrium
-    strategies in poker games.
-    
-    Attributes:
-        value_network (nn.Module): Neural network for advantage estimation.
-        optimizer (optim.Optimizer): Optimizer for the value network.
-        memory_size (int): Maximum size of the replay memories.
-        batch_size (int): Batch size for training.
-        game_type (str): Type of game to play ('holdem' or 'spingo').
-        num_players (int): Number of players in the game.
-        memories (List[ReplayMemory]): Replay memories for each player.
-    """
-    
-    def __init__(self, value_network: nn.Module, input_dim: int, action_dim: int, 
-                game_type: str = 'spingo', num_players: int = 3,
-                memory_size: int = 10000, batch_size: int = 128,
-                learning_rate: float = 0.001):
-        """
-        Initialize Deep CFR algorithm.
-        
-        Args:
-            value_network (nn.Module): Neural network for advantage estimation.
-            input_dim (int): Input dimension for state representation.
-            action_dim (int): Dimension of the action space.
-            game_type (str, optional): Type of game. Defaults to 'spingo'.
-            num_players (int, optional): Number of players. Defaults to 3.
-            memory_size (int, optional): Replay memory size. Defaults to 10000.
-            batch_size (int, optional): Batch size for training. Defaults to 128.
-            learning_rate (float, optional): Learning rate. Defaults to 0.001.
-        """
-        self.value_network = value_network
-        self.optimizer = optim.Adam(value_network.parameters(), lr=learning_rate)
-        self.memory_size = memory_size
-        self.batch_size = batch_size
-        self.game_type = game_type
-        self.num_players = num_players
-        self.input_dim = input_dim
-        self.action_dim = action_dim
-        
-        # Initialize a replay memory for each player
-        self.memories = [ReplayMemory(memory_size) for _ in range(num_players)]
-        
-        # Create device (CPU or GPU)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.value_network.to(self.device)
-        
-        # Training metrics
-        self.iteration = 0
-        self.advantage_losses = []
-        
-    def train_iteration(self):
-        """Run a single training iteration."""
-        self.iteration += 1
-        
-        # Create a new game
-        if self.game_type == 'spingo':
-            game = SpinGoGame(num_players=self.num_players)
-            game_state = game.start_new_hand()
+        # Determine framework
+        if framework == "auto":
+            if TORCH_AVAILABLE:
+                self.framework = "pytorch"
+            elif TF_AVAILABLE:
+                self.framework = "tensorflow"
+            else:
+                raise ImportError("No supported deep learning framework found")
         else:
-            game_state = GameState(num_players=self.num_players)
-            game_state.deal_hole_cards()
+            if framework == "pytorch" and not TORCH_AVAILABLE:
+                raise ImportError("PyTorch not available")
+            elif framework == "tensorflow" and not TF_AVAILABLE:
+                raise ImportError("TensorFlow not available")
+            self.framework = framework
         
-        # Collect samples through traversal
-        for player_id in range(self.num_players):
-            self._traverse_game_tree(game_state, player_id)
+        # Initialize solver state
+        self.game_state_class = game_state_class
+        self.advantage_networks = {}
+        self.strategy_network = None
+        self.advantage_buffers = {}
+        self.strategy_buffer = []
+        self.iterations = 0
         
-        # Train value network on each player's samples
-        total_loss = 0
-        for player_id in range(self.num_players):
-            if len(self.memories[player_id]) >= self.batch_size:
-                loss = self._train_value_network(player_id)
-                total_loss += loss
+        # Get neural network parameters from config
+        self.batch_size = self.config["training"]["batch_size"]
+        self.learning_rate = self.config["training"]["learning_rate"]
         
-        self.advantage_losses.append(total_loss / self.num_players)
+        # Create an initial game state to determine input dimensions
+        initial_state = self.game_state_class()
         
-    def _traverse_game_tree(self, game_state: GameState, traverser_id: int, 
-                          iteration: int = None, reach_prob: float = 1.0):
+        # Determine number of players and input dimensions
+        self.num_players = initial_state.get_num_players()
+        info_set_dim = initial_state.get_info_set_dimension()
+        num_actions = len(initial_state.get_legal_actions())
+        
+        # Initialize networks and buffers for each player
+        for player in range(self.num_players):
+            # Create advantage network
+            self.advantage_networks[player] = self._create_advantage_network(
+                input_dim=info_set_dim,
+                output_dim=num_actions
+            )
+            
+            # Create advantage buffer
+            self.advantage_buffers[player] = deque(maxlen=1000000)  # Limit buffer size
+        
+        # Create strategy network
+        self.strategy_network = self._create_strategy_network(
+            input_dim=info_set_dim,
+            output_dim=num_actions
+        )
+    
+    def _create_advantage_network(self, input_dim: int, output_dim: int) -> Any:
         """
-        Traverse the game tree to collect advantage samples.
+        Create an advantage network.
         
         Args:
-            game_state (GameState): Current game state.
-            traverser_id (int): ID of the traversing player.
-            iteration (int, optional): Current iteration. Defaults to None.
-            reach_prob (float, optional): Reach probability. Defaults to 1.0.
+            input_dim (int): Input dimension (info set dimension).
+            output_dim (int): Output dimension (number of actions).
         
         Returns:
-            float: The expected utility of the state.
+            Any: Advantage network.
         """
-        if iteration is None:
-            iteration = self.iteration
-        
-        if game_state.is_terminal():
-            # Return utility at terminal state
-            return game_state.get_utility(traverser_id)
-        
-        current_player = game_state.current_player
-        
-        if current_player == traverser_id:
-            # It's the traverser's turn - compute advantages
-            legal_actions = game_state.get_legal_actions()
-            state_representation = self._get_state_representation(game_state, traverser_id)
+        if self.framework == "pytorch":
+            # Create PyTorch network
+            network = AdvantageNetworkPyTorch(
+                input_dim=input_dim,
+                hidden_dim=self.config["model"]["value_network"]["hidden_layers"][0],
+                output_dim=output_dim
+            )
             
-            # Get advantages using value network
-            advantages = self._compute_advantages(state_representation, legal_actions)
+            # Define optimizer
+            optimizer = optim.Adam(network.parameters(), lr=self.learning_rate)
             
-            # Use regret matching to select an action
-            strategy = self._compute_strategy(advantages)
+            return {
+                "network": network,
+                "optimizer": optimizer
+            }
+        
+        elif self.framework == "tensorflow":
+            # Create TensorFlow network
+            network = AdvantageNetworkTensorFlow(
+                input_dim=input_dim,
+                hidden_dim=self.config["model"]["value_network"]["hidden_layers"][0],
+                output_dim=output_dim
+            )
             
-            # Sample an action from the strategy
-            action_idx = np.random.choice(len(legal_actions), p=strategy)
+            # Define optimizer
+            optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
+            
+            return {
+                "network": network,
+                "optimizer": optimizer
+            }
+    
+    def _create_strategy_network(self, input_dim: int, output_dim: int) -> Any:
+        """
+        Create a strategy network.
+        
+        Args:
+            input_dim (int): Input dimension (info set dimension).
+            output_dim (int): Output dimension (number of actions).
+        
+        Returns:
+            Any: Strategy network.
+        """
+        if self.framework == "pytorch":
+            # Create PyTorch network
+            network = StrategyNetworkPyTorch(
+                input_dim=input_dim,
+                hidden_dim=self.config["model"]["policy_network"]["hidden_layers"][0],
+                output_dim=output_dim
+            )
+            
+            # Define optimizer
+            optimizer = optim.Adam(network.parameters(), lr=self.learning_rate)
+            
+            return {
+                "network": network,
+                "optimizer": optimizer
+            }
+        
+        elif self.framework == "tensorflow":
+            # Create TensorFlow network
+            network = StrategyNetworkTensorFlow(
+                input_dim=input_dim,
+                hidden_dim=self.config["model"]["policy_network"]["hidden_layers"][0],
+                output_dim=output_dim
+            )
+            
+            # Define optimizer
+            optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
+            
+            return {
+                "network": network,
+                "optimizer": optimizer
+            }
+    
+    def _forward(self, network: Any, inputs: np.ndarray) -> np.ndarray:
+        """
+        Forward pass through a network.
+        
+        Args:
+            network (Any): Neural network.
+            inputs (np.ndarray): Input data.
+        
+        Returns:
+            np.ndarray: Network output.
+        """
+        if self.framework == "pytorch":
+            # Convert inputs to PyTorch tensor
+            inputs_tensor = torch.tensor(inputs, dtype=torch.float32)
+            
+            # Optimize for GPU if available
+            inputs_tensor = optimize_tensor_for_gpu(inputs_tensor)
+            
+            # Forward pass
+            with torch.no_grad():
+                outputs = network["network"](inputs_tensor)
+            
+            # Convert back to numpy
+            return outputs.cpu().numpy()
+        
+        elif self.framework == "tensorflow":
+            # Convert inputs to TensorFlow tensor
+            inputs_tensor = tf.convert_to_tensor(inputs, dtype=tf.float32)
+            
+            # Optimize for GPU if available
+            inputs_tensor = optimize_tensor_for_gpu(inputs_tensor)
+            
+            # Forward pass
+            outputs = network["network"](inputs_tensor, training=False)
+            
+            # Convert back to numpy
+            return outputs.numpy()
+    
+    def _train_network(self, network: Any, inputs: np.ndarray, targets: np.ndarray, 
+                     weights: Optional[np.ndarray] = None) -> float:
+        """
+        Train a network on a batch of data.
+        
+        Args:
+            network (Any): Neural network and optimizer.
+            inputs (np.ndarray): Input data.
+            targets (np.ndarray): Target values.
+            weights (Optional[np.ndarray], optional): Sample weights. Defaults to None.
+        
+        Returns:
+            float: Loss value.
+        """
+        if self.framework == "pytorch":
+            # Convert data to PyTorch tensors
+            inputs_tensor = torch.tensor(inputs, dtype=torch.float32)
+            targets_tensor = torch.tensor(targets, dtype=torch.float32)
+            
+            # Add weights if provided
+            if weights is not None:
+                weights_tensor = torch.tensor(weights, dtype=torch.float32)
+            else:
+                weights_tensor = torch.ones_like(targets_tensor[:, 0])
+            
+            # Optimize for GPU if available
+            inputs_tensor = optimize_tensor_for_gpu(inputs_tensor)
+            targets_tensor = optimize_tensor_for_gpu(targets_tensor)
+            weights_tensor = optimize_tensor_for_gpu(weights_tensor)
+            
+            # Zero gradients
+            network["optimizer"].zero_grad()
+            
+            # Forward pass
+            outputs = network["network"](inputs_tensor)
+            
+            # Compute weighted MSE loss
+            losses = F.mse_loss(outputs, targets_tensor, reduction='none')
+            loss = torch.mean(torch.sum(losses, dim=1) * weights_tensor)
+            
+            # Backward pass and optimization
+            loss.backward()
+            network["optimizer"].step()
+            
+            return loss.item()
+        
+        elif self.framework == "tensorflow":
+            # Convert data to TensorFlow tensors
+            inputs_tensor = tf.convert_to_tensor(inputs, dtype=tf.float32)
+            targets_tensor = tf.convert_to_tensor(targets, dtype=tf.float32)
+            
+            # Add weights if provided
+            if weights is not None:
+                weights_tensor = tf.convert_to_tensor(weights, dtype=tf.float32)
+            else:
+                weights_tensor = tf.ones_like(targets_tensor[:, 0])
+            
+            # Optimize for GPU if available
+            inputs_tensor = optimize_tensor_for_gpu(inputs_tensor)
+            targets_tensor = optimize_tensor_for_gpu(targets_tensor)
+            weights_tensor = optimize_tensor_for_gpu(weights_tensor)
+            
+            # Training step
+            with tf.GradientTape() as tape:
+                outputs = network["network"](inputs_tensor, training=True)
+                losses = tf.reduce_sum(tf.keras.losses.mean_squared_error(
+                    targets_tensor, outputs), axis=1)
+                loss = tf.reduce_mean(losses * weights_tensor)
+            
+            # Compute gradients and apply
+            gradients = tape.gradient(loss, network["network"].trainable_variables)
+            network["optimizer"].apply_gradients(zip(gradients, network["network"].trainable_variables))
+            
+            return loss.numpy()
+    
+    def traverse_game_tree(self, state: Any, reach_probs: List[float], player: int, 
+                         iteration: int) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """
+        Traverse the game tree and collect advantage samples for a player.
+        
+        Args:
+            state: Current game state.
+            reach_probs (List[float]): Reach probabilities for each player.
+            player (int): Player to collect samples for.
+            iteration (int): Current iteration.
+        
+        Returns:
+            List[Tuple[np.ndarray, np.ndarray, float]]: Collected samples.
+        """
+        if state.is_terminal():
+            return []
+        
+        if state.is_chance_node():
+            outcomes = state.get_chance_outcomes()
+            samples = []
+            
+            for action, prob in outcomes:
+                next_state = state.apply_action(action)
+                child_samples = self.traverse_game_tree(next_state, reach_probs, player, iteration)
+                samples.extend(child_samples)
+            
+            return samples
+        
+        current_player = state.get_current_player()
+        info_set_key = state.get_info_set_key()
+        info_set_vector = state.get_info_set_vector()
+        legal_actions = state.get_legal_actions()
+        num_actions = len(legal_actions)
+        samples = []
+        
+        # Skip if not a player's turn
+        if current_player != player:
+            # Use current strategy to make a decision
+            action_probs = self.get_action_probabilities(state)
+            action_idx = np.random.choice(len(action_probs), p=action_probs)
             action = legal_actions[action_idx]
             
-            # Recursively traverse with the selected action
-            next_state = game_state.apply_action(action)
-            value = self._traverse_game_tree(next_state, traverser_id, iteration, reach_prob)
+            # Update reach probability
+            new_reach_probs = reach_probs.copy()
+            new_reach_probs[current_player] *= action_probs[action_idx]
             
-            # Update advantages and store samples
-            for i, a in enumerate(legal_actions):
-                next_state = game_state.apply_action(a)
-                if i == action_idx:
-                    # We already computed this value
-                    a_value = value
-                else:
-                    # Compute counterfactual value
-                    a_value = self._traverse_game_tree(next_state, traverser_id, iteration, 0)
-                
-                # Compute advantage
-                advantage = a_value - value
-                
-                # Store the sample for later training
-                self.memories[traverser_id].push(state_representation, advantage)
+            # Recurse on the new state
+            next_state = state.apply_action(action)
+            child_samples = self.traverse_game_tree(next_state, new_reach_probs, player, iteration)
+            samples.extend(child_samples)
             
-            return value
-        else:
-            # It's another player's turn - use strategy from value network
-            legal_actions = game_state.get_legal_actions()
-            state_representation = self._get_state_representation(game_state, current_player)
-            
-            # Get advantages using value network
-            advantages = self._compute_advantages(state_representation, legal_actions)
-            
-            # Compute strategy from advantages
-            strategy = self._compute_strategy(advantages)
-            
-            # Sample an action from the strategy
-            action_idx = np.random.choice(len(legal_actions), p=strategy)
-            action = legal_actions[action_idx]
-            
-            # Recursively traverse with the selected action
-            next_state = game_state.apply_action(action)
-            return self._traverse_game_tree(next_state, traverser_id, iteration, reach_prob)
-    
-    def _compute_advantages(self, state: np.ndarray, legal_actions: List) -> np.ndarray:
-        """
-        Compute advantages for each legal action.
+            return samples
         
-        Args:
-            state (np.ndarray): State representation.
-            legal_actions (List): List of legal actions.
-            
-        Returns:
-            np.ndarray: Advantages for each action.
-        """
-        # Convert state to torch tensor
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        # For player's turn, compute advantages
+        # Get values for each action using the advantage network
+        action_values = np.zeros(num_actions)
         
-        # Get predictions from value network
-        with torch.no_grad():
-            advantages = self.value_network(state_tensor).cpu().numpy().flatten()
-        
-        # Mask illegal actions with large negative values
-        action_mask = np.zeros(self.action_dim)
         for i, action in enumerate(legal_actions):
-            action_type = action.action_type.value - 1  # Convert enum to 0-indexed
-            action_mask[action_type] = 1
+            # Apply action
+            next_state = state.apply_action(action)
+            
+            if next_state.is_terminal():
+                # Get immediate value for terminal states
+                action_values[i] = next_state.get_utility()
+            else:
+                # Recurse for non-terminal states
+                new_reach_probs = reach_probs.copy()
+                new_reach_probs[current_player] = 1.0  # Set to 1 since we're computing counterfactual values
+                
+                # Get child samples (will be added to samples later)
+                child_samples = self.traverse_game_tree(next_state, new_reach_probs, player, iteration)
+                samples.extend(child_samples)
+                
+                # Compute value for this action
+                action_values[i] = next_state.get_expected_value(player)
         
-        # Apply mask (set illegal actions to large negative values)
-        masked_advantages = advantages * action_mask + (1 - action_mask) * (-1e9)
+        # Compute average value
+        cf_value = np.mean(action_values)
         
-        return masked_advantages
+        # Compute advantages
+        advantages = action_values - cf_value
+        
+        # Create one-hot target vector
+        target = np.zeros(num_actions)
+        
+        # Fill non-zero values for legal actions
+        for i in range(num_actions):
+            target[i] = advantages[i]
+        
+        # Add sample: (info_set_vector, target, weight)
+        weight = np.prod(reach_probs) / reach_probs[player]  # Reach probability of other players
+        sample = (info_set_vector, target, weight)
+        samples.append(sample)
+        
+        # Add sample to advantage buffer
+        self.advantage_buffers[player].append((info_set_vector, target, weight, iteration))
+        
+        # Add to strategy buffer if using average strategy
+        strategy_target = np.zeros(num_actions)
+        
+        # Use regret matching to compute strategy
+        positive_advantages = np.maximum(0, advantages)
+        advantage_sum = np.sum(positive_advantages)
+        
+        if advantage_sum > 0:
+            strategy_target = positive_advantages / advantage_sum
+        else:
+            strategy_target = np.ones(num_actions) / num_actions  # Uniform strategy
+        
+        # Add strategy sample
+        self.strategy_buffer.append((info_set_vector, strategy_target, weight, iteration))
+        
+        return samples
     
-    def _compute_strategy(self, advantages: np.ndarray) -> np.ndarray:
+    def train_advantage_network(self, player: int, batch_size: Optional[int] = None) -> float:
         """
-        Compute a strategy from advantages using regret matching.
+        Train the advantage network for a player.
         
         Args:
-            advantages (np.ndarray): Action advantages.
-            
+            player (int): Player to train.
+            batch_size (Optional[int], optional): Batch size. Defaults to None.
+        
         Returns:
-            np.ndarray: Strategy (action probabilities).
+            float: Training loss.
         """
-        # Convert advantages to regrets (only positive regrets matter)
-        regrets = np.maximum(advantages, 0)
+        if batch_size is None:
+            batch_size = self.batch_size
         
-        # If all regrets are 0, use uniform strategy
-        if np.sum(regrets) <= 0:
-            # Find indices of valid actions (not extremely negative)
-            valid_indices = np.where(advantages > -1e8)[0]
-            strategy = np.zeros_like(advantages)
-            strategy[valid_indices] = 1.0 / len(valid_indices)
-            return strategy
+        # Skip if not enough samples
+        if len(self.advantage_buffers[player]) < batch_size:
+            return 0.0
         
-        # Normalize to get a proper strategy
-        strategy = regrets / np.sum(regrets)
-        return strategy
+        # Sample from the buffer
+        samples = random.sample(self.advantage_buffers[player], batch_size)
+        
+        # Unpack samples
+        info_sets = []
+        advantages = []
+        weights = []
+        iterations = []
+        
+        for info_set, advantage, weight, iteration in samples:
+            info_sets.append(info_set)
+            advantages.append(advantage)
+            weights.append(weight)
+            iterations.append(iteration)
+        
+        # Convert to numpy arrays
+        info_sets = np.array(info_sets)
+        advantages = np.array(advantages)
+        weights = np.array(weights)
+        iterations = np.array(iterations)
+        
+        # Apply iteration weighting (more recent iterations have higher weight)
+        iteration_weights = (iterations / self.iterations) ** 2
+        combined_weights = weights * iteration_weights
+        
+        # Train the network
+        loss = self._train_network(
+            network=self.advantage_networks[player],
+            inputs=info_sets,
+            targets=advantages,
+            weights=combined_weights
+        )
+        
+        return loss
     
-    def _get_state_representation(self, game_state: GameState, player_id: int) -> np.ndarray:
+    def train_strategy_network(self, batch_size: Optional[int] = None) -> float:
         """
-        Convert a game state to a vector representation for the neural network.
+        Train the strategy network.
         
         Args:
-            game_state (GameState): The game state.
-            player_id (int): The player ID.
-            
+            batch_size (Optional[int], optional): Batch size. Defaults to None.
+        
         Returns:
-            np.ndarray: Vector representation of the state.
+            float: Training loss.
         """
-        # This is a simplified representation - in practice, you would want a more
-        # sophisticated state encoding that captures the relevant game information
+        if batch_size is None:
+            batch_size = self.batch_size
         
-        # Basic features:
-        # - Player's cards
-        # - Community cards
-        # - Pot size
-        # - Player positions
-        # - Betting history
-        # - Stack sizes
+        # Skip if not enough samples
+        if len(self.strategy_buffer) < batch_size:
+            return 0.0
         
-        # Placeholder implementation - replace with actual feature extraction
-        feature_vector = np.zeros(self.input_dim)
+        # Sample from the buffer
+        samples = random.sample(self.strategy_buffer, batch_size)
         
-        # Return the feature vector
-        return feature_vector
+        # Unpack samples
+        info_sets = []
+        strategies = []
+        weights = []
+        iterations = []
+        
+        for info_set, strategy, weight, iteration in samples:
+            info_sets.append(info_set)
+            strategies.append(strategy)
+            weights.append(weight)
+            iterations.append(iteration)
+        
+        # Convert to numpy arrays
+        info_sets = np.array(info_sets)
+        strategies = np.array(strategies)
+        weights = np.array(weights)
+        iterations = np.array(iterations)
+        
+        # Apply iteration weighting (more recent iterations have higher weight)
+        iteration_weights = iterations / self.iterations
+        combined_weights = weights * iteration_weights
+        
+        # Train the network
+        loss = self._train_network(
+            network=self.strategy_network,
+            inputs=info_sets,
+            targets=strategies,
+            weights=combined_weights
+        )
+        
+        return loss
     
-    def _train_value_network(self, player_id: int) -> float:
+    def train(self, num_iterations: int, num_traversals: int = 100, 
+            callback: Optional[Callable] = None) -> Dict[str, Any]:
         """
-        Train the value network on a batch of samples for a player.
+        Train the Deep CFR solver.
         
         Args:
-            player_id (int): The player ID.
-            
+            num_iterations (int): Number of iterations.
+            num_traversals (int, optional): Number of tree traversals per iteration. Defaults to 100.
+            callback (Optional[Callable], optional): Callback function. Defaults to None.
+        
         Returns:
-            float: The training loss.
+            Dict[str, Any]: Training results.
         """
-        # Sample a batch from memory
-        batch = self.memories[player_id].sample(self.batch_size)
-        states, advantages = zip(*batch)
+        start_time = time.time()
+        metrics = []
         
-        # Convert to torch tensors
-        states_tensor = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
-        advantages_tensor = torch.tensor(np.array(advantages), dtype=torch.float32).unsqueeze(1).to(self.device)
+        # Training loop
+        for i in range(num_iterations):
+            # Update iteration counter
+            self.iterations += 1
+            
+            # Traverse game tree for each player
+            for player in range(self.num_players):
+                for _ in range(num_traversals):
+                    # Initialize game state
+                    initial_state = self.game_state_class()
+                    
+                    # Determine initial reach probabilities
+                    reach_probs = [1.0] * self.num_players
+                    
+                    # Traverse game tree
+                    self.traverse_game_tree(initial_state, reach_probs, player, self.iterations)
+                
+                # Train advantage network for this player
+                advantage_loss = self.train_advantage_network(player)
+                
+                # Log progress
+                logger.debug(f"Iteration {i+1}/{num_iterations} - Player {player} - Advantage Loss: {advantage_loss:.6f}")
+            
+            # Train strategy network
+            strategy_loss = self.train_strategy_network()
+            
+            # Log progress
+            if (i + 1) % max(1, num_iterations // 10) == 0:
+                elapsed = time.time() - start_time
+                logger.info(f"Iteration {i+1}/{num_iterations} - Strategy Loss: {strategy_loss:.6f} - Time: {elapsed:.2f}s")
+                
+                # Record metrics
+                metric = {
+                    "iteration": i + 1,
+                    "strategy_loss": float(strategy_loss),
+                    "time": elapsed
+                }
+                
+                metrics.append(metric)
+                
+                # Log to game logger
+                self.game_logger.log_training_metrics("DeepCFR", metric, i + 1)
+            
+            # Call callback if provided
+            if callback is not None:
+                callback(i, strategy_loss, self)
         
-        # Forward pass
-        predicted_advantages = self.value_network(states_tensor)
+        total_time = time.time() - start_time
+        logger.info(f"Deep CFR training completed in {total_time:.2f} seconds")
         
-        # Compute loss
-        loss_fn = nn.MSELoss()
-        loss = loss_fn(predicted_advantages, advantages_tensor)
-        
-        # Backward pass and optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        return loss.item()
+        # Return results
+        return {
+            "algorithm": "DeepCFR",
+            "iterations": num_iterations,
+            "total_time": total_time,
+            "advantage_buffer_sizes": {p: len(self.advantage_buffers[p]) for p in range(self.num_players)},
+            "strategy_buffer_size": len(self.strategy_buffer),
+            "metrics": metrics
+        }
     
-    def act(self, game_state: GameState, player_id: int) -> Any:
+    def get_action_probabilities(self, state: Any) -> np.ndarray:
         """
-        Choose an action using the current policy.
+        Get action probabilities for a given state.
         
         Args:
-            game_state (GameState): Current game state.
-            player_id (int): The player ID.
-            
+            state: Game state.
+        
         Returns:
-            Any: The chosen action.
+            np.ndarray: Probability distribution over actions.
         """
-        legal_actions = game_state.get_legal_actions()
-        state_representation = self._get_state_representation(game_state, player_id)
+        # Get information set
+        info_set_vector = state.get_info_set_vector()
         
-        # Get advantages using value network
-        advantages = self._compute_advantages(state_representation, legal_actions)
+        # Reshape for batch prediction
+        inputs = np.array([info_set_vector])
         
-        # Compute strategy from advantages
-        strategy = self._compute_strategy(advantages)
+        # Forward pass through strategy network
+        outputs = self._forward(self.strategy_network, inputs)[0]
         
-        # Sample an action from the strategy
-        action_idx = np.random.choice(len(legal_actions), p=strategy)
-        return legal_actions[action_idx]
+        # Get valid actions mask
+        legal_actions = state.get_legal_actions()
+        action_mask = np.zeros(outputs.shape)
+        
+        for i, _ in enumerate(legal_actions):
+            action_mask[i] = 1
+        
+        # Apply mask and normalize
+        masked_outputs = outputs * action_mask
+        action_sum = np.sum(masked_outputs)
+        
+        if action_sum > 0:
+            return masked_outputs / action_sum
+        else:
+            # Uniform distribution if all outputs are zero
+            return action_mask / np.sum(action_mask)
     
-    def evaluate(self, num_games: int = 100, opponent_type: str = 'rule_based') -> Dict[str, Any]:
+    def get_advantage_values(self, state: Any, player: int) -> np.ndarray:
         """
-        Evaluate the agent against opponents.
+        Get advantage values for a given state and player.
         
         Args:
-            num_games (int, optional): Number of games to play. Defaults to 100.
-            opponent_type (str, optional): Type of opponents. Defaults to 'rule_based'.
-            
+            state: Game state.
+            player (int): Player index.
+        
         Returns:
-            Dict[str, Any]: Evaluation metrics.
+            np.ndarray: Advantage values for each action.
         """
-        # Placeholder for evaluation logic
-        results = {
-            'win_rate': 0.0,
-            'avg_utility': 0.0,
-            'games_played': num_games
+        # Get information set
+        info_set_vector = state.get_info_set_vector()
+        
+        # Reshape for batch prediction
+        inputs = np.array([info_set_vector])
+        
+        # Forward pass through advantage network
+        outputs = self._forward(self.advantage_networks[player], inputs)[0]
+        
+        return outputs
+    
+    def save(self, filepath: Optional[str] = None) -> str:
+        """
+        Save the Deep CFR model.
+        
+        Args:
+            filepath (Optional[str], optional): Directory to save the model. Defaults to None.
+        
+        Returns:
+            str: Path to the saved model.
+        """
+        if filepath is None:
+            # Generate default filepath
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filepath = os.path.join(self.config["agents"]["save_dir"], f"deep_cfr_model_{timestamp}")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(filepath, exist_ok=True)
+        
+        # Save metadata
+        metadata = {
+            "algorithm": "DeepCFR",
+            "framework": self.framework,
+            "iterations": self.iterations,
+            "timestamp": time.time(),
+            "num_players": self.num_players
         }
         
-        return results
+        with open(os.path.join(filepath, "metadata.json"), 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Save advantage networks
+        for player in range(self.num_players):
+            self._save_network(
+                os.path.join(filepath, f"advantage_network_{player}"),
+                self.advantage_networks[player]["network"]
+            )
+        
+        # Save strategy network
+        self._save_network(
+            os.path.join(filepath, "strategy_network"),
+            self.strategy_network["network"]
+        )
+        
+        logger.info(f"Saved Deep CFR model to {filepath}")
+        return filepath
+    
+    def load(self, filepath: str) -> bool:
+        """
+        Load the Deep CFR model.
+        
+        Args:
+            filepath (str): Path to the saved model.
+        
+        Returns:
+            bool: Whether the load was successful.
+        """
+        try:
+            # Load metadata
+            with open(os.path.join(filepath, "metadata.json"), 'r') as f:
+                metadata = json.load(f)
+            
+            # Check algorithm
+            if metadata.get("algorithm") != "DeepCFR":
+                logger.error(f"Invalid algorithm in {filepath}, expected DeepCFR")
+                return False
+            
+            # Check framework
+            if metadata.get("framework") != self.framework:
+                logger.error(f"Framework mismatch: model {metadata.get('framework')}, current {self.framework}")
+                return False
+            
+            # Load iterations
+            self.iterations = metadata.get("iterations", 0)
+            
+            # Load advantage networks
+            for player in range(self.num_players):
+                self._load_network(
+                    os.path.join(filepath, f"advantage_network_{player}"),
+                    self.advantage_networks[player]["network"]
+                )
+            
+            # Load strategy network
+            self._load_network(
+                os.path.join(filepath, "strategy_network"),
+                self.strategy_network["network"]
+            )
+            
+            logger.info(f"Loaded Deep CFR model from {filepath}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error loading Deep CFR model from {filepath}: {e}")
+            return False
+    
+    def _save_network(self, filepath: str, network: Any):
+        """
+        Save a neural network.
+        
+        Args:
+            filepath (str): Path to save the network.
+            network: Neural network.
+        """
+        if self.framework == "pytorch":
+            # Save PyTorch model
+            torch.save(network.state_dict(), f"{filepath}.pt")
+        
+        elif self.framework == "tensorflow":
+            # Save TensorFlow model
+            network.save(f"{filepath}.keras")
+    
+    def _load_network(self, filepath: str, network: Any):
+        """
+        Load a neural network.
+        
+        Args:
+            filepath (str): Path to the saved network.
+            network: Neural network.
+        """
+        if self.framework == "pytorch":
+            # Load PyTorch model
+            state_dict = torch.load(f"{filepath}.pt")
+            network.load_state_dict(state_dict)
+        
+        elif self.framework == "tensorflow":
+            # Load TensorFlow model
+            loaded_model = tf.keras.models.load_model(f"{filepath}.keras")
+            network.set_weights(loaded_model.get_weights())
+
+
+# Neural network implementations for PyTorch
+class AdvantageNetworkPyTorch(nn.Module):
+    """PyTorch implementation of the advantage network."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """
+        Initialize the advantage network.
+        
+        Args:
+            input_dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension.
+            output_dim (int): Output dimension.
+        """
+        super().__init__()
+        
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        """Forward pass."""
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class StrategyNetworkPyTorch(nn.Module):
+    """PyTorch implementation of the strategy network."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """
+        Initialize the strategy network.
+        
+        Args:
+            input_dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension.
+            output_dim (int): Output dimension.
+        """
+        super().__init__()
+        
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        """Forward pass."""
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return F.softmax(x, dim=1)
+
+
+# Neural network implementations for TensorFlow
+class AdvantageNetworkTensorFlow(tf.keras.Model):
+    """TensorFlow implementation of the advantage network."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """
+        Initialize the advantage network.
+        
+        Args:
+            input_dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension.
+            output_dim (int): Output dimension.
+        """
+        super().__init__()
+        
+        self.fc1 = tf.keras.layers.Dense(hidden_dim, activation='relu')
+        self.fc2 = tf.keras.layers.Dense(hidden_dim, activation='relu')
+        self.fc3 = tf.keras.layers.Dense(output_dim)
+    
+    def call(self, inputs, training=False):
+        """Forward pass."""
+        x = self.fc1(inputs)
+        x = self.fc2(x)
+        return self.fc3(x)
+
+
+class StrategyNetworkTensorFlow(tf.keras.Model):
+    """TensorFlow implementation of the strategy network."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """
+        Initialize the strategy network.
+        
+        Args:
+            input_dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension.
+            output_dim (int): Output dimension.
+        """
+        super().__init__()
+        
+        self.fc1 = tf.keras.layers.Dense(hidden_dim, activation='relu')
+        self.fc2 = tf.keras.layers.Dense(hidden_dim, activation='relu')
+        self.fc3 = tf.keras.layers.Dense(output_dim)
+        self.softmax = tf.keras.layers.Softmax()
+    
+    def call(self, inputs, training=False):
+        """Forward pass."""
+        x = self.fc1(inputs)
+        x = self.fc2(x)
+        x = self.fc3(x)
+        return self.softmax(x)

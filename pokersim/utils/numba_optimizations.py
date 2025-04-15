@@ -1,18 +1,41 @@
 """
-Optimized functions using Numba for poker hand evaluation and simulation.
+Numba optimizations for poker simulations.
 
-This module provides high-performance implementations of computationally intensive
-operations in poker, such as hand evaluation, monte carlo simulation, and game
-state evaluation. These functions are optimized using Numba's just-in-time compilation.
+This module provides Numba-accelerated functions for performance-critical
+operations in poker simulations, such as hand evaluation, equity calculation,
+and Monte Carlo simulations.
 """
 
 import numpy as np
-from numba import njit, jit, prange
-from typing import List, Tuple, Dict, Any, Optional
+import random
+from typing import Dict, List, Tuple, Any, Optional, Union
+import time
+import logging
 
-# Constants for card representation
-RANKS = 13  # Ace through King
-SUITS = 4   # Clubs, Diamonds, Hearts, Spades
+try:
+    import numba
+    from numba import jit, njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    # Create dummy decorators for when Numba is not available
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator if args and callable(args[0]) else decorator
+    
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator if args and callable(args[0]) else decorator
+    
+    def prange(*args, **kwargs):
+        return range(*args, **kwargs)
+
+
+# Constants for card representations
+RANKS = np.array([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])  # 2-14 (A=14)
+SUITS = np.array([0, 1, 2, 3])  # 0=spades, 1=hearts, 2=diamonds, 3=clubs
 
 
 @njit
@@ -21,464 +44,329 @@ def card_to_int(rank: int, suit: int) -> int:
     Convert a card's rank and suit to an integer representation.
     
     Args:
-        rank (int): Card rank (0-12 for 2-A)
-        suit (int): Card suit (0-3 for clubs, diamonds, hearts, spades)
+        rank (int): Card rank (2-14, where Ace=14).
+        suit (int): Card suit (0-3).
     
     Returns:
-        int: Integer representation of the card
+        int: Integer representation of the card.
     """
-    return rank * SUITS + suit
+    return rank * 4 + suit
 
 
 @njit
 def int_to_card(card_int: int) -> Tuple[int, int]:
     """
-    Convert an integer card representation back to rank and suit.
+    Convert an integer representation back to rank and suit.
     
     Args:
-        card_int (int): Integer representation of a card
+        card_int (int): Integer representation of the card.
     
     Returns:
-        Tuple[int, int]: (rank, suit)
+        Tuple[int, int]: Rank and suit.
     """
-    rank = card_int // SUITS
-    suit = card_int % SUITS
+    rank = card_int // 4
+    suit = card_int % 4
     return rank, suit
 
 
 @njit
-def evaluate_hand_fast(hole_cards: np.ndarray, community_cards: np.ndarray) -> int:
+def evaluate_hand_fast(cards: np.ndarray) -> Tuple[int, int]:
     """
-    Evaluate a poker hand quickly using Numba optimization.
-    
-    This function evaluates a Texas Hold'em hand (2 hole cards + up to 5 community cards)
-    and returns a hand rank, where higher is better.
+    Fast hand evaluation using Numba.
     
     Args:
-        hole_cards (np.ndarray): Array of hole card integers (2 cards)
-        community_cards (np.ndarray): Array of community card integers (up to 5 cards)
+        cards (np.ndarray): Array of card integers.
     
     Returns:
-        int: Hand rank value, higher is better
+        Tuple[int, int]: Hand rank and value.
     """
-    # Combine hole cards and community cards
-    all_cards = np.concatenate((hole_cards, community_cards))
+    if len(cards) < 5:
+        return 0, 0
     
-    # Count ranks and suits
-    rank_count = np.zeros(RANKS, dtype=np.int32)
-    suit_count = np.zeros(SUITS, dtype=np.int32)
+    # Extract ranks and suits
+    ranks = np.array([card // 4 for card in cards])
+    suits = np.array([card % 4 for card in cards])
     
-    for card in all_cards:
-        rank, suit = int_to_card(card)
-        rank_count[rank] += 1
-        suit_count[suit] += 1
+    # Count rank occurrences
+    rank_counts = np.zeros(15, dtype=np.int32)
+    for rank in ranks:
+        rank_counts[rank] += 1
+    
+    # Sort cards by rank (descending)
+    sorted_indices = np.argsort(-ranks)
+    sorted_ranks = ranks[sorted_indices]
     
     # Check for flush
-    flush_suit = -1
-    for suit in range(SUITS):
-        if suit_count[suit] >= 5:
-            flush_suit = suit
+    is_flush = False
+    for suit in range(4):
+        if np.sum(suits == suit) >= 5:
+            is_flush = True
+            flush_cards = cards[suits == suit]
+            flush_ranks = np.array([card // 4 for card in flush_cards])
+            # Sort flush cards by rank (descending)
+            flush_ranks = np.sort(flush_ranks)[::-1]
             break
     
     # Check for straight
-    straight_high = -1
-    count = 0
-    for rank in range(RANKS):
-        if rank_count[rank] > 0:
-            count += 1
-            if count >= 5:
-                straight_high = rank
-        else:
-            count = 0
+    is_straight = False
+    straight_high = 0
     
-    # Special case: A-5 straight (Ace can be low)
-    if count == 4 and rank_count[12] > 0 and straight_high == 3:  # 12 is Ace, 3 is 5
-        straight_high = 3  # 5-high straight
-    
-    # Check for straight flush
-    straight_flush = False
-    if flush_suit >= 0 and straight_high >= 0:
-        # Check if there are 5 consecutive cards of the same suit
-        flush_cards = []
-        for card in all_cards:
-            rank, suit = int_to_card(card)
-            if suit == flush_suit:
-                flush_cards.append(rank)
-        
-        flush_cards = np.sort(np.array(flush_cards))
-        if len(flush_cards) >= 5:
-            count = 1
-            for i in range(1, len(flush_cards)):
-                if flush_cards[i] == flush_cards[i-1] + 1:
-                    count += 1
-                    if count >= 5:
-                        straight_flush = True
-                        break
-                else:
-                    count = 1
-            
-            # Special case: A-5 straight flush
-            if not straight_flush and 12 in flush_cards and 0 in flush_cards and 1 in flush_cards and 2 in flush_cards and 3 in flush_cards:
-                straight_flush = True
-    
-    # Compute hand ranks based on poker hand hierarchy
-    if straight_flush:
-        return 8 * 10000000 + straight_high  # Straight flush
-    
-    # Count the number of pairs, trips, quads
-    pairs = 0
-    trips = 0
-    quads = 0
-    pair_ranks = []
-    trip_ranks = []
-    quad_ranks = []
-    
-    for rank in range(RANKS):
-        if rank_count[rank] == 2:
-            pairs += 1
-            pair_ranks.append(rank)
-        elif rank_count[rank] == 3:
-            trips += 1
-            trip_ranks.append(rank)
-        elif rank_count[rank] == 4:
-            quads += 1
-            quad_ranks.append(rank)
-    
-    # Sort for kickers
-    pair_ranks.sort(reverse=True)
-    trip_ranks.sort(reverse=True)
-    
-    if quads > 0:
-        return 7 * 10000000 + quad_ranks[0]  # Four of a kind
-    
-    if trips > 0 and pairs > 0:
-        return 6 * 10000000 + trip_ranks[0] * 100 + pair_ranks[0]  # Full house
-    
-    if flush_suit >= 0:
-        # Find the 5 highest cards in the flush suit
-        flush_ranks = []
-        for card in all_cards:
-            rank, suit = int_to_card(card)
-            if suit == flush_suit:
-                flush_ranks.append(rank)
-        
-        flush_ranks.sort(reverse=True)
-        flush_ranks = flush_ranks[:5]
-        
-        # Compute flush value based on the 5 highest cards
-        flush_value = 0
-        for i, rank in enumerate(flush_ranks):
-            flush_value += rank * (100 ** (4 - i))
-        
-        return 5 * 10000000 + flush_value  # Flush
-    
-    if straight_high >= 0:
-        return 4 * 10000000 + straight_high  # Straight
-    
-    if trips > 0:
-        # Find kickers for three of a kind
-        kickers = []
-        for rank in range(RANKS-1, -1, -1):
-            if rank_count[rank] > 0 and rank not in trip_ranks:
-                kickers.append(rank)
-                if len(kickers) == 2:
-                    break
-        
-        return 3 * 10000000 + trip_ranks[0] * 10000 + kickers[0] * 100 + kickers[1]  # Three of a kind
-    
-    if pairs >= 2:
-        # Find kicker for two pair
-        kicker = -1
-        for rank in range(RANKS-1, -1, -1):
-            if rank_count[rank] > 0 and rank not in pair_ranks:
-                kicker = rank
+    # Handle Ace low straight (A-5-4-3-2)
+    if np.sum(rank_counts[2:6]) == 4 and rank_counts[14] == 1:
+        is_straight = True
+        straight_high = 5
+    else:
+        # Check for other straights
+        for i in range(10):
+            high_card = 14 - i
+            if all(rank_counts[high_card - j] >= 1 for j in range(5)):
+                is_straight = True
+                straight_high = high_card
                 break
-        
-        return 2 * 10000000 + pair_ranks[0] * 10000 + pair_ranks[1] * 100 + kicker  # Two pair
     
-    if pairs == 1:
-        # Find kickers for one pair
-        kickers = []
-        for rank in range(RANKS-1, -1, -1):
-            if rank_count[rank] > 0 and rank not in pair_ranks:
-                kickers.append(rank)
-                if len(kickers) == 3:
-                    break
-        
-        kicker_value = 0
-        for i, rank in enumerate(kickers):
-            kicker_value += rank * (100 ** (2 - i))
-        
-        return 1 * 10000000 + pair_ranks[0] * 1000000 + kicker_value  # One pair
+    # Determine hand type and value
+    
+    # Straight flush
+    if is_straight and is_flush:
+        if straight_high == 14:
+            return 9, 0  # Royal flush
+        else:
+            return 8, straight_high  # Straight flush
+    
+    # Four of a kind
+    four_kind = np.where(rank_counts == 4)[0]
+    if len(four_kind) > 0:
+        kicker = np.max(np.where(rank_counts == 1)[0]) if np.any(rank_counts == 1) else 0
+        return 7, four_kind[0] * 20 + kicker
+    
+    # Full house
+    three_kind = np.where(rank_counts == 3)[0]
+    pair = np.where(rank_counts == 2)[0]
+    if len(three_kind) > 0 and len(pair) > 0:
+        return 6, three_kind[-1] * 20 + pair[-1]
+    
+    # Check for full house with two three of a kinds
+    if len(three_kind) > 1:
+        return 6, three_kind[-1] * 20 + three_kind[-2]
+    
+    # Flush
+    if is_flush:
+        flush_value = sum(flush_ranks[i] * (10000 // (10 ** i)) for i in range(5))
+        return 5, flush_value
+    
+    # Straight
+    if is_straight:
+        return 4, straight_high
+    
+    # Three of a kind
+    if len(three_kind) > 0:
+        kickers = sorted_ranks[np.where(sorted_ranks != three_kind[0])[0]][:2]
+        value = three_kind[0] * 400 + kickers[0] * 20 + kickers[1]
+        return 3, value
+    
+    # Two pair
+    if len(pair) >= 2:
+        kicker = np.max(np.where(rank_counts == 1)[0]) if np.any(rank_counts == 1) else 0
+        value = pair[-1] * 400 + pair[-2] * 20 + kicker
+        return 2, value
+    
+    # One pair
+    if len(pair) == 1:
+        kickers = sorted_ranks[np.where(sorted_ranks != pair[0])[0]][:3]
+        value = pair[0] * 8000 + kickers[0] * 400 + kickers[1] * 20 + kickers[2]
+        return 1, value
     
     # High card
-    high_cards = []
-    for rank in range(RANKS-1, -1, -1):
-        if rank_count[rank] > 0:
-            high_cards.append(rank)
-            if len(high_cards) == 5:
-                break
-    
-    high_card_value = 0
-    for i, rank in enumerate(high_cards):
-        high_card_value += rank * (100 ** (4 - i))
-    
-    return high_card_value  # High card
+    value = sum(sorted_ranks[i] * (10000 // (10 ** i)) for i in range(5))
+    return 0, value
 
 
 @njit(parallel=True)
-def monte_carlo_hand_equity(hole_cards: np.ndarray, community_cards: np.ndarray, 
-                         num_players: int, num_simulations: int = 1000) -> float:
+def monte_carlo_equity(hole_cards: np.ndarray, num_players: int, board: np.ndarray, 
+                      iterations: int) -> np.ndarray:
     """
-    Estimate hand equity through Monte Carlo simulation.
-    
-    This function runs multiple simulations to estimate the probability of winning
-    with a given hand against a specified number of opponents.
+    Calculate equity using Monte Carlo simulation.
     
     Args:
-        hole_cards (np.ndarray): Array of hole card integers (2 cards)
-        community_cards (np.ndarray): Array of community card integers (up to 5 cards)
-        num_players (int): Number of players in the hand
-        num_simulations (int, optional): Number of simulations to run. Defaults to 1000.
+        hole_cards (np.ndarray): Array of hole cards for each player.
+        num_players (int): Number of players.
+        board (np.ndarray): Community cards on the board.
+        iterations (int): Number of simulations to run.
     
     Returns:
-        float: Estimated equity (probability of winning)
+        np.ndarray: Equity estimates for each player.
     """
-    if len(community_cards) == 5:  # All community cards are out, no need to simulate
-        return estimate_showdown_equity(hole_cards, community_cards, num_players)
+    # Initialize equity counters
+    equity = np.zeros(num_players, dtype=np.float64)
     
-    # Create a deck excluding known cards
-    deck = []
-    for rank in range(RANKS):
-        for suit in range(SUITS):
-            card = card_to_int(rank, suit)
-            if card not in hole_cards and card not in community_cards:
-                deck.append(card)
+    # Create a deck of cards (0-51)
+    full_deck = np.arange(52, dtype=np.int32)
     
-    deck = np.array(deck)
+    # Remove cards that are already dealt
+    used_cards = np.concatenate((hole_cards.flatten(), board))
+    used_cards = used_cards[used_cards >= 0]  # Remove placeholders (-1)
     
-    # Run simulations
-    wins = 0
-    for sim in prange(num_simulations):
-        np.random.shuffle(deck)
+    for _ in prange(iterations):
+        # Make a copy of the current board
+        current_board = board.copy()
+        remaining_board = 5 - len(current_board[current_board >= 0])
         
-        # Deal cards to opponents
-        used_cards = 0
-        opponent_hole_cards = []
-        for player in range(num_players - 1):  # Exclude hero
-            opponent_hole_cards.append(deck[used_cards:used_cards+2])
-            used_cards += 2
+        # Create available cards
+        available = np.setdiff1d(full_deck, used_cards)
+        np.random.shuffle(available)
         
-        # Deal remaining community cards
-        remaining = 5 - len(community_cards)
-        sim_community = np.concatenate((community_cards, deck[used_cards:used_cards+remaining]))
+        # Complete the board
+        completed_board = np.concatenate((current_board[current_board >= 0], 
+                                        available[:remaining_board]))
         
-        # Evaluate hero's hand
-        hero_rank = evaluate_hand_fast(hole_cards, sim_community)
+        # Evaluate hands and determine winners
+        best_hand = np.zeros(num_players, dtype=np.int32)
+        best_value = np.zeros(num_players, dtype=np.int32)
         
-        # Check if hero wins
-        win = True
-        for opp_cards in opponent_hole_cards:
-            opp_rank = evaluate_hand_fast(opp_cards, sim_community)
-            if opp_rank >= hero_rank:  # Tie or loss
-                win = False
-                break
+        for p in range(num_players):
+            player_hole = hole_cards[p]
+            if player_hole[0] >= 0 and player_hole[1] >= 0:  # Valid hole cards
+                player_cards = np.concatenate((player_hole, completed_board))
+                hand_rank, hand_value = evaluate_hand_fast(player_cards)
+                best_hand[p] = hand_rank
+                best_value[p] = hand_value
+            else:
+                best_hand[p] = -1  # Invalid/folded player
         
-        if win:
-            wins += 1
+        # Determine winners
+        max_hand = np.max(best_hand)
+        if max_hand >= 0:  # At least one valid player
+            hand_winners = np.where(best_hand == max_hand)[0]
+            
+            if len(hand_winners) == 1:
+                # Single winner
+                equity[hand_winners[0]] += 1.0
+            else:
+                # Tie - check hand values
+                max_value = np.max(best_value[hand_winners])
+                value_winners = hand_winners[best_value[hand_winners] == max_value]
+                
+                # Split equity among winners
+                split_equity = 1.0 / len(value_winners)
+                for winner in value_winners:
+                    equity[winner] += split_equity
     
-    return wins / num_simulations
+    # Convert to probabilities
+    return equity / iterations
 
 
 @njit
-def estimate_showdown_equity(hole_cards: np.ndarray, community_cards: np.ndarray, 
-                          num_players: int, num_samples: int = 100) -> float:
+def calculate_hand_strength(hole_cards: np.ndarray, board: np.ndarray) -> float:
     """
-    Estimate showdown equity when all community cards are known.
-    
-    This function samples possible opponent hands and calculates win probability.
+    Calculate the hand strength (probability of winning against random hands).
     
     Args:
-        hole_cards (np.ndarray): Array of hole card integers (2 cards)
-        community_cards (np.ndarray): Array of community card integers (5 cards)
-        num_players (int): Number of players in the hand
-        num_samples (int, optional): Number of opponent hand combinations to sample. 
-                                   Defaults to 100.
+        hole_cards (np.ndarray): Player's hole cards.
+        board (np.ndarray): Community cards on the board.
     
     Returns:
-        float: Estimated equity (probability of winning)
+        float: Hand strength (0.0-1.0).
     """
-    # Create a deck excluding known cards
-    deck = []
-    for rank in range(RANKS):
-        for suit in range(SUITS):
-            card = card_to_int(rank, suit)
-            if card not in hole_cards and card not in community_cards:
-                deck.append(card)
+    total_hands = 0
+    ahead_or_tied = 0
     
-    deck = np.array(deck)
+    # Create a deck of cards (0-51)
+    full_deck = np.arange(52, dtype=np.int32)
     
-    # Evaluate hero's hand
-    hero_rank = evaluate_hand_fast(hole_cards, community_cards)
+    # Remove cards that are already dealt
+    used_cards = np.concatenate((hole_cards, board))
+    used_cards = used_cards[used_cards >= 0]  # Remove placeholders (-1)
+    available = np.setdiff1d(full_deck, used_cards)
     
-    # Sample possible opponent hands
-    wins = 0
-    for _ in range(num_samples):
-        np.random.shuffle(deck)
+    # Evaluate our hand
+    our_cards = np.concatenate((hole_cards, board[board >= 0]))
+    our_rank, our_value = evaluate_hand_fast(our_cards)
+    
+    # Sample random opponent hands
+    samples = min(1000, len(available) * (len(available) - 1) // 2)
+    for _ in range(samples):
+        # Choose random hole cards for opponent
+        idx1 = np.random.randint(0, len(available))
+        idx2 = np.random.randint(0, len(available))
+        if idx1 == idx2:
+            idx2 = (idx2 + 1) % len(available)
         
-        # Simulate opponents
-        win = True
-        used_cards = 0
+        opp_hole = np.array([available[idx1], available[idx2]])
         
-        for _ in range(num_players - 1):  # Exclude hero
-            opp_cards = deck[used_cards:used_cards+2]
-            used_cards += 2
-            
-            opp_rank = evaluate_hand_fast(opp_cards, community_cards)
-            if opp_rank >= hero_rank:  # Tie or loss
-                win = False
-                break
+        # Evaluate opponent's hand
+        opp_cards = np.concatenate((opp_hole, board[board >= 0]))
+        opp_rank, opp_value = evaluate_hand_fast(opp_cards)
         
-        if win:
-            wins += 1
-    
-    return wins / num_samples
-
-
-@jit
-def optimal_strategy_icm(stacks: np.ndarray, payouts: np.ndarray, 
-                       small_blind: int, big_blind: int) -> np.ndarray:
-    """
-    Calculate an optimal push/fold strategy using the Independent Chip Model (ICM).
-    
-    This function computes push/fold ranges for Spin & Go tournaments based on ICM equity.
-    
-    Args:
-        stacks (np.ndarray): Array of player stack sizes
-        payouts (np.ndarray): Array of tournament payouts
-        small_blind (int): Small blind amount
-        big_blind (int): Big blind amount
-    
-    Returns:
-        np.ndarray: ICM push/fold thresholds for each player position
-    """
-    # Calculate ICM equity for each player
-    total_chips = np.sum(stacks)
-    equity_before = calculate_icm_equity(stacks, payouts, total_chips)
-    
-    # Calculate push/fold thresholds
-    num_players = len(stacks)
-    thresholds = np.zeros(num_players)
-    
-    for position in range(num_players):
-        # Skip players who are already all-in
-        if stacks[position] <= 0:
-            thresholds[position] = 1.0  # Will never push
-            continue
+        # Compare hands
+        if our_rank > opp_rank or (our_rank == opp_rank and our_value >= opp_value):
+            ahead_or_tied += 1
         
-        # Simulate different push scenarios
-        push_eq = np.zeros(169)  # 13*13 possible starting hands
-        
-        for hand_idx in range(169):
-            # Simulate pushing with this hand
-            new_stacks = stacks.copy()
-            
-            # Calculate chance of winning all-in
-            # This is a simplified model - in reality, we'd use actual hand equities
-            # We're using a simple approximation here based on hand ranking
-            win_prob = (169 - hand_idx) / 169  # Higher ranking hands have higher probability
-            
-            # Simulate outcomes
-            equity_sum = 0
-            
-            # Win scenario
-            if win_prob > 0:
-                new_stacks_win = new_stacks.copy()
-                new_stacks_win[position] += big_blind  # Win blinds
-                equity_win = calculate_icm_equity(new_stacks_win, payouts, total_chips)
-                equity_sum += win_prob * equity_win[position]
-            
-            # Loss scenario
-            if win_prob < 1:
-                new_stacks_lose = new_stacks.copy()
-                new_stacks_lose[position] = 0  # Bust
-                equity_lose = calculate_icm_equity(new_stacks_lose, payouts, total_chips)
-                equity_sum += (1 - win_prob) * equity_lose[position]
-            
-            # Store EV
-            push_eq[hand_idx] = equity_sum
-        
-        # Find threshold where pushing becomes +EV compared to folding
-        fold_equity = equity_before[position]
-        threshold_idx = 0
-        
-        for hand_idx in range(169):
-            if push_eq[hand_idx] > fold_equity:
-                threshold_idx = hand_idx
-                break
-        
-        # Convert to a percentage
-        thresholds[position] = threshold_idx / 169
+        total_hands += 1
     
-    return thresholds
+    # Calculate strength
+    return ahead_or_tied / total_hands if total_hands > 0 else 0.0
 
 
 @njit
-def calculate_icm_equity(stacks: np.ndarray, payouts: np.ndarray, total_chips: int) -> np.ndarray:
+def calculate_pot_odds(pot_size: float, call_amount: float) -> float:
     """
-    Calculate ICM (Independent Chip Model) equity for tournament players.
+    Calculate pot odds.
     
     Args:
-        stacks (np.ndarray): Array of player stack sizes
-        payouts (np.ndarray): Array of tournament payouts (prize pool distribution)
-        total_chips (int): Total chips in play
+        pot_size (float): Current pot size.
+        call_amount (float): Amount needed to call.
     
     Returns:
-        np.ndarray: ICM equity for each player (dollar value)
+        float: Pot odds (0.0-1.0).
     """
-    num_players = len(stacks)
-    equity = np.zeros(num_players)
+    return call_amount / (pot_size + call_amount) if (pot_size + call_amount) > 0 else 0.0
+
+
+@njit
+def calculate_expected_value(win_probability: float, pot_size: float, 
+                           call_amount: float) -> float:
+    """
+    Calculate the expected value of a call.
     
-    # If only one player left, they get all the money
-    if np.sum(stacks > 0) == 1:
-        for i in range(num_players):
-            if stacks[i] > 0:
-                equity[i] = np.sum(payouts)
-                return equity
+    Args:
+        win_probability (float): Probability of winning the hand.
+        pot_size (float): Current pot size.
+        call_amount (float): Amount needed to call.
     
-    # Calculate probability of finishing in each position
-    finish_prob = np.zeros((num_players, len(payouts)))
+    Returns:
+        float: Expected value.
+    """
+    return win_probability * pot_size - (1 - win_probability) * call_amount
+
+
+# Optimized functions for poker agent decision making
+def optimize_agent_decision(f):
+    """
+    Decorator to optimize agent decision functions with Numba if available.
     
-    for player in range(num_players):
-        if stacks[player] <= 0:
-            continue
-            
-        # Probability of finishing 1st
-        finish_prob[player, 0] = stacks[player] / total_chips
-        
-        # Recursive calculation for other positions
-        for position in range(1, len(payouts)):
-            # Calculate probability of finishing in position for each stack size
-            prob_sum = 0
-            for other_player in range(num_players):
-                if other_player != player and stacks[other_player] > 0:
-                    # Probability of other player finishing first, then this player finishing position
-                    prob_first = stacks[other_player] / total_chips
-                    
-                    # Calculate remaining stack probabilities
-                    new_stacks = stacks.copy()
-                    new_stacks[other_player] = 0
-                    new_total = total_chips - stacks[other_player]
-                    
-                    if new_total > 0:
-                        prob_position = stacks[player] / new_total
-                        prob_sum += prob_first * prob_position
-            
-            finish_prob[player, position] = prob_sum
+    Args:
+        f: Function to optimize.
     
-    # Calculate equity from finish probabilities
-    for player in range(num_players):
-        for position in range(len(payouts)):
-            equity[player] += finish_prob[player, position] * payouts[position]
+    Returns:
+        Optimized function.
+    """
+    if HAS_NUMBA:
+        return njit(f)
+    return f
+
+
+@optimize_agent_decision
+def should_fold(hand_strength: float, pot_odds: float, aggression: float = 0.0) -> bool:
+    """
+    Determine if the agent should fold based on hand strength and pot odds.
     
-    return equity
+    Args:
+        hand_strength (float): Hand strength (0.0-1.0).
+        pot_odds (float): Pot odds (0.0-1.0).
+        aggression (float, optional): Aggression factor (-1.0 to 1.0). Defaults to 0.0.
+    
+    Returns:
+        bool: Whether to fold.
+    """
+    threshold = pot_odds * (1.0 - 0.2 * aggression)
+    return hand_strength < threshold

@@ -1,460 +1,452 @@
 """
-GPU Optimization utilities for poker simulation and training.
+GPU optimization utilities for the poker simulator.
 
-This module provides utilities for optimizing performance on GPUs,
-including data transfer, memory management, and parallel processing 
-for faster poker hand evaluation and neural network training.
+This module provides utilities for optimizing poker simulations with GPU acceleration,
+including CUDA support through PyTorch and TensorFlow, as well as integration with
+Numba for accelerated CPU computation when GPU is not available.
 """
 
 import os
-import numpy as np
-import torch
-import torch.nn as nn
-from typing import List, Dict, Tuple, Any, Optional, Union
+import time
 import logging
+from typing import Dict, List, Tuple, Any, Optional, Union
+import numpy as np
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# PyTorch-based GPU utilities
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+# TensorFlow-based GPU utilities
+try:
+    import tensorflow as tf
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
+
+# Numba-based optimization utilities
+try:
+    import numba
+    from numba import cuda
+    HAS_NUMBA = True
+    HAS_CUDA = numba.cuda.is_available()
+except ImportError:
+    HAS_NUMBA = False
+    HAS_CUDA = False
 
 
-def get_available_devices() -> List[torch.device]:
+class GPUManager:
     """
-    Get a list of available devices (CPU and GPUs).
+    Manager for GPU acceleration in poker simulations.
     
-    Returns:
-        List[torch.device]: List of available devices.
-    """
-    devices = [torch.device("cpu")]
-    
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        logger.info(f"Found {num_gpus} CUDA-capable devices")
-        
-        for i in range(num_gpus):
-            device = torch.device(f"cuda:{i}")
-            devices.append(device)
-            
-            # Log device properties
-            properties = torch.cuda.get_device_properties(i)
-            logger.info(f"Device {i}: {properties.name}")
-            logger.info(f"  Memory: {properties.total_memory / 1e9:.2f} GB")
-            logger.info(f"  CUDA Capability: {properties.major}.{properties.minor}")
-    else:
-        logger.info("No CUDA-capable devices found, using CPU only")
-    
-    return devices
-
-
-def select_best_device() -> torch.device:
-    """
-    Select the best available device for training.
-    
-    Returns:
-        torch.device: The best available device.
-    """
-    if not torch.cuda.is_available():
-        logger.info("CUDA not available, using CPU")
-        return torch.device("cpu")
-    
-    # Find GPU with the most free memory
-    best_device = 0
-    max_free_memory = 0
-    
-    for i in range(torch.cuda.device_count()):
-        # Get memory info
-        torch.cuda.set_device(i)
-        torch.cuda.empty_cache()
-        
-        # Get current memory usage
-        reserved = torch.cuda.memory_reserved(i)
-        allocated = torch.cuda.memory_allocated(i)
-        free = reserved - allocated
-        
-        logger.info(f"GPU {i}: {free / 1e9:.2f} GB free")
-        
-        if free > max_free_memory:
-            max_free_memory = free
-            best_device = i
-    
-    logger.info(f"Selected GPU {best_device} as best device")
-    return torch.device(f"cuda:{best_device}")
-
-
-def optimize_model_for_device(model: nn.Module, device: torch.device) -> nn.Module:
-    """
-    Optimize a model for a specific device.
-    
-    Args:
-        model (nn.Module): The PyTorch model to optimize.
-        device (torch.device): Target device.
-    
-    Returns:
-        nn.Module: Optimized model.
-    """
-    # Move model to device
-    model = model.to(device)
-    
-    # Apply optimizations based on device
-    if device.type == "cuda":
-        # Enable cuDNN autotuner if available
-        torch.backends.cudnn.benchmark = True
-        
-        # Try to convert model to TorchScript for better performance
-        try:
-            # Create a sample input for tracing
-            sample_shape = next(model.parameters()).shape[1]
-            sample_input = torch.zeros(1, sample_shape, device=device)
-            
-            # Trace the model
-            traced_model = torch.jit.trace(model, sample_input)
-            logger.info("Successfully converted model to TorchScript")
-            return traced_model
-        except Exception as e:
-            logger.warning(f"Could not convert model to TorchScript: {e}")
-            logger.warning("Using original model instead")
-    
-    return model
-
-
-def optimize_tensor_for_gpu(tensor: np.ndarray, device: torch.device) -> torch.Tensor:
-    """
-    Optimize a numpy array for GPU processing.
-    
-    Args:
-        tensor (np.ndarray): Numpy array.
-        device (torch.device): Target device.
-    
-    Returns:
-        torch.Tensor: Tensor optimized for the device.
-    """
-    # Convert numpy array to torch tensor
-    tensor = torch.from_numpy(tensor)
-    
-    # Move to device
-    tensor = tensor.to(device)
-    
-    # Optimize memory layout for the device
-    if device.type == "cuda":
-        tensor = tensor.contiguous()
-    
-    return tensor
-
-
-def batch_process(func, items: List[Any], batch_size: int = 512, 
-                device: Optional[torch.device] = None) -> List[Any]:
-    """
-    Process a list of items in batches for GPU efficiency.
-    
-    Args:
-        func: Function to apply to each batch.
-        items (List[Any]): Items to process.
-        batch_size (int, optional): Batch size. Defaults to 512.
-        device (Optional[torch.device], optional): Device to use. Defaults to None.
-    
-    Returns:
-        List[Any]: Processed items.
-    """
-    if device is None:
-        device = select_best_device()
-    
-    results = []
-    
-    # Process in batches
-    for i in range(0, len(items), batch_size):
-        batch = items[i:i + batch_size]
-        
-        # Process batch
-        batch_results = func(batch, device)
-        results.extend(batch_results)
-    
-    return results
-
-
-class TensorMemoryPool:
-    """
-    Memory pool for reusing GPU tensors.
-    
-    This class helps avoid frequent GPU memory allocations and deallocations
-    by reusing tensor memory.
+    This class provides a unified interface for GPU acceleration using either
+    PyTorch or TensorFlow, with fallback to CPU computation using Numba when
+    GPU is not available.
     
     Attributes:
-        pools (Dict): Dictionary of tensor pools, keyed by shape and dtype.
+        use_gpu (bool): Whether GPU acceleration is enabled.
+        framework (str): Deep learning framework being used ('pytorch', 'tensorflow', or 'none').
+        device: Device to run computations (specific to framework).
     """
     
-    def __init__(self):
-        """Initialize a tensor memory pool."""
-        self.pools = {}
-    
-    def get(self, shape: Tuple[int, ...], dtype: torch.dtype, 
-          device: torch.device) -> torch.Tensor:
+    def __init__(self, use_gpu: bool = True, framework: str = "auto"):
         """
-        Get a tensor of the specified shape, dtype, and device.
+        Initialize the GPU manager.
         
         Args:
-            shape (Tuple[int, ...]): Shape of the tensor.
-            dtype (torch.dtype): Data type of the tensor.
-            device (torch.device): Device for the tensor.
-        
-        Returns:
-            torch.Tensor: A tensor from the pool or a new tensor.
+            use_gpu (bool, optional): Whether to use GPU acceleration if available. Defaults to True.
+            framework (str, optional): Deep learning framework to use. Defaults to "auto".
         """
-        key = (shape, dtype, str(device))
+        self.use_gpu = use_gpu
         
-        if key in self.pools and self.pools[key]:
-            # Reuse a tensor from the pool
-            tensor = self.pools[key].pop()
-            tensor.zero_()
-            return tensor
+        # Check GPU availability for each framework
+        self.torch_gpu_available = HAS_TORCH and torch.cuda.is_available() if use_gpu else False
+        self.tf_gpu_available = HAS_TF and len(tf.config.list_physical_devices('GPU')) > 0 if use_gpu else False
+        self.numba_gpu_available = HAS_NUMBA and HAS_CUDA if use_gpu else False
+        
+        # Select framework
+        if framework == "auto":
+            if self.torch_gpu_available:
+                self.framework = "pytorch"
+            elif self.tf_gpu_available:
+                self.framework = "tensorflow"
+            elif HAS_TORCH:
+                self.framework = "pytorch"
+                self.use_gpu = False
+            elif HAS_TF:
+                self.framework = "tensorflow"
+                self.use_gpu = False
+            else:
+                self.framework = "none"
+                self.use_gpu = False
         else:
-            # Create a new tensor
-            return torch.zeros(shape, dtype=dtype, device=device)
+            self.framework = framework
+            
+            # Check if the requested framework is available
+            if framework == "pytorch" and not HAS_TORCH:
+                logging.warning("PyTorch requested but not available, falling back to CPU")
+                self.use_gpu = False
+            elif framework == "tensorflow" and not HAS_TF:
+                logging.warning("TensorFlow requested but not available, falling back to CPU")
+                self.use_gpu = False
+        
+        # Initialize device based on framework
+        if self.framework == "pytorch":
+            self.device = torch.device("cuda" if self.torch_gpu_available else "cpu")
+        elif self.framework == "tensorflow":
+            if self.tf_gpu_available:
+                self.device = "/GPU:0"
+                # Configure TensorFlow to use memory growth
+                gpus = tf.config.list_physical_devices('GPU')
+                if gpus:
+                    try:
+                        for gpu in gpus:
+                            tf.config.experimental.set_memory_growth(gpu, True)
+                    except RuntimeError as e:
+                        logging.error(f"GPU memory growth configuration error: {e}")
+            else:
+                self.device = "/CPU:0"
+        else:
+            self.device = "cpu"
+        
+        # Log initialization
+        self._log_gpu_info()
     
-    def put(self, tensor: torch.Tensor):
+    def _log_gpu_info(self) -> None:
+        """Log information about the GPU configuration."""
+        if self.use_gpu:
+            if self.framework == "pytorch" and self.torch_gpu_available:
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_count = torch.cuda.device_count()
+                logging.info(f"Using PyTorch with GPU acceleration: {gpu_name} (Count: {gpu_count})")
+            elif self.framework == "tensorflow" and self.tf_gpu_available:
+                gpus = tf.config.list_physical_devices('GPU')
+                logging.info(f"Using TensorFlow with GPU acceleration: {len(gpus)} GPUs")
+            elif self.numba_gpu_available:
+                logging.info(f"Using Numba with CUDA acceleration")
+            else:
+                logging.info(f"No GPU acceleration available")
+        else:
+            logging.info(f"GPU acceleration disabled, using {self.framework} on CPU")
+    
+    def to_device(self, data: Any) -> Any:
         """
-        Return a tensor to the pool.
+        Move data to the appropriate device (GPU or CPU).
         
         Args:
-            tensor (torch.Tensor): Tensor to return to the pool.
+            data: Data to move (tensor, array, or similar).
+            
+        Returns:
+            Data on the target device.
         """
-        key = (tensor.shape, tensor.dtype, str(tensor.device))
+        if not self.use_gpu:
+            return data
         
-        if key not in self.pools:
-            self.pools[key] = []
+        if self.framework == "pytorch" and self.torch_gpu_available:
+            if isinstance(data, torch.Tensor):
+                return data.to(self.device)
+            elif isinstance(data, np.ndarray):
+                return torch.tensor(data, device=self.device)
+            else:
+                return data  # Can't move to device
         
-        # Add tensor to the pool
-        self.pools[key].append(tensor)
+        elif self.framework == "tensorflow" and self.tf_gpu_available:
+            if isinstance(data, tf.Tensor):
+                with tf.device(self.device):
+                    return tf.identity(data)
+            elif isinstance(data, np.ndarray):
+                with tf.device(self.device):
+                    return tf.convert_to_tensor(data)
+            else:
+                return data  # Can't move to device
+        
+        return data  # Default case
     
-    def clear(self):
-        """Clear all pools."""
-        self.pools = {}
-
-
-# Create a global memory pool
-memory_pool = TensorMemoryPool()
-
-
-class GPUBatchProcessor:
-    """
-    Batch processor for GPU-optimized poker hand evaluations.
-    
-    This class manages efficient batch processing of poker hand evaluations
-    on the GPU, including data transfer and memory management.
-    
-    Attributes:
-        device (torch.device): Device to use for processing.
-        batch_size (int): Size of batches for processing.
-    """
-    
-    def __init__(self, device: Optional[torch.device] = None, batch_size: int = 1024):
+    def from_device(self, data: Any) -> Any:
         """
-        Initialize a GPU batch processor.
+        Move data from device to CPU (for numpy operations).
         
         Args:
-            device (Optional[torch.device], optional): Device to use. Defaults to None.
-            batch_size (int, optional): Batch size. Defaults to 1024.
+            data: Data to move (tensor, array, or similar).
+            
+        Returns:
+            Data on CPU as numpy array if possible.
         """
-        self.device = device if device is not None else select_best_device()
-        self.batch_size = batch_size
+        if self.framework == "pytorch" and isinstance(data, torch.Tensor):
+            return data.detach().cpu().numpy()
         
-        logger.info(f"Initialized GPU batch processor on {self.device}")
-        logger.info(f"Batch size: {self.batch_size}")
+        elif self.framework == "tensorflow" and isinstance(data, tf.Tensor):
+            return data.numpy()
+        
+        elif isinstance(data, np.ndarray):
+            return data
+        
+        return data  # Default case
     
-    def process_hands(self, hole_cards: List[Tuple[int, int]], 
-                    community_cards: List[int]) -> List[int]:
+    def memory_stats(self) -> Dict[str, float]:
         """
-        Evaluate multiple poker hands in a GPU-optimized manner.
-        
-        Args:
-            hole_cards (List[Tuple[int, int]]): List of hole card pairs.
-            community_cards (List[int]): Community cards.
+        Get memory statistics for the GPU.
         
         Returns:
-            List[int]: Hand strength scores.
+            Dict[str, float]: Memory statistics.
         """
-        # Prepare data for GPU
-        num_hands = len(hole_cards)
+        stats = {}
         
-        # Organize into batches
+        if not self.use_gpu:
+            return stats
+        
+        if self.framework == "pytorch" and self.torch_gpu_available:
+            stats['memory_allocated'] = torch.cuda.memory_allocated(0)
+            stats['memory_reserved'] = torch.cuda.memory_reserved(0)
+            stats['memory_total'] = torch.cuda.get_device_properties(0).total_memory
+            stats['utilization'] = stats['memory_allocated'] / stats['memory_total']
+        
+        elif self.framework == "tensorflow" and self.tf_gpu_available:
+            # TensorFlow doesn't provide direct GPU memory statistics
+            # We can only report device availability
+            stats['gpu_available'] = True
+        
+        return stats
+    
+    def synchronize(self) -> None:
+        """Synchronize the device (wait for pending operations to complete)."""
+        if not self.use_gpu:
+            return
+        
+        if self.framework == "pytorch" and self.torch_gpu_available:
+            torch.cuda.synchronize()
+    
+    def parallel_map(self, func: Any, data_list: List[Any], 
+                   batch_size: int = 32) -> List[Any]:
+        """
+        Apply a function to a list of data in parallel using GPU acceleration.
+        
+        Args:
+            func: Function to apply.
+            data_list (List[Any]): List of data items.
+            batch_size (int, optional): Batch size for processing. Defaults to 32.
+            
+        Returns:
+            List[Any]: Results from applying the function to each data item.
+        """
         results = []
         
-        for i in range(0, num_hands, self.batch_size):
-            batch_size = min(self.batch_size, num_hands - i)
-            batch_hole_cards = hole_cards[i:i + batch_size]
-            
-            # Process batch
-            batch_results = self._process_hand_batch(batch_hole_cards, community_cards)
-            results.extend(batch_results)
+        if not self.use_gpu:
+            # CPU fallback - still batch for efficiency
+            for i in range(0, len(data_list), batch_size):
+                batch = data_list[i:i + batch_size]
+                batch_results = [func(item) for item in batch]
+                results.extend(batch_results)
+            return results
+        
+        if self.framework == "pytorch" and self.torch_gpu_available:
+            # PyTorch GPU implementation
+            for i in range(0, len(data_list), batch_size):
+                batch = data_list[i:i + batch_size]
+                
+                # Convert batch to tensors if they aren't already
+                batch_tensors = []
+                for item in batch:
+                    if isinstance(item, torch.Tensor):
+                        batch_tensors.append(item.to(self.device))
+                    elif isinstance(item, np.ndarray):
+                        batch_tensors.append(torch.tensor(item, device=self.device))
+                    else:
+                        batch_tensors.append(item)  # Can't convert
+                
+                # Apply function to each item
+                batch_results = [func(item) for item in batch_tensors]
+                
+                # Convert results back to CPU if they're tensors
+                processed_results = []
+                for res in batch_results:
+                    if isinstance(res, torch.Tensor):
+                        processed_results.append(res.detach().cpu().numpy())
+                    else:
+                        processed_results.append(res)
+                
+                results.extend(processed_results)
+        
+        elif self.framework == "tensorflow" and self.tf_gpu_available:
+            # TensorFlow GPU implementation
+            with tf.device(self.device):
+                for i in range(0, len(data_list), batch_size):
+                    batch = data_list[i:i + batch_size]
+                    
+                    # Convert batch to tensors if they aren't already
+                    batch_tensors = []
+                    for item in batch:
+                        if isinstance(item, tf.Tensor):
+                            batch_tensors.append(item)
+                        elif isinstance(item, np.ndarray):
+                            batch_tensors.append(tf.convert_to_tensor(item))
+                        else:
+                            batch_tensors.append(item)  # Can't convert
+                    
+                    # Apply function to each item
+                    batch_results = [func(item) for item in batch_tensors]
+                    
+                    # Convert results back to CPU if they're tensors
+                    processed_results = []
+                    for res in batch_results:
+                        if isinstance(res, tf.Tensor):
+                            processed_results.append(res.numpy())
+                        else:
+                            processed_results.append(res)
+                    
+                    results.extend(processed_results)
         
         return results
     
-    def _process_hand_batch(self, hole_cards: List[Tuple[int, int]], 
-                          community_cards: List[int]) -> List[int]:
+    def get_supported_tensor_type(self):
         """
-        Process a batch of poker hands on the GPU.
-        
-        Args:
-            hole_cards (List[Tuple[int, int]]): List of hole card pairs.
-            community_cards (List[int]): Community cards.
+        Get the appropriate tensor type for the selected framework.
         
         Returns:
-            List[int]: Hand strength scores.
+            The tensor class for the framework.
         """
-        # This is a placeholder for GPU-optimized hand evaluation logic
-        # In a real implementation, you would use a CUDA kernel or PyTorch operations
-        # to evaluate hands in parallel on the GPU
-        
-        # For now, just return dummy scores
-        return [i for i in range(len(hole_cards))]
+        if self.framework == "pytorch":
+            return torch.Tensor
+        elif self.framework == "tensorflow":
+            return tf.Tensor
+        else:
+            return np.ndarray
     
-    def simulate_equity(self, hole_cards: List[Tuple[int, int]], 
-                      community_cards: List[int], num_players: int, 
-                      num_simulations: int = 1000) -> List[float]:
+    def get_framework_info(self) -> Dict[str, Any]:
         """
-        Simulate equity for multiple hands using GPU acceleration.
-        
-        Args:
-            hole_cards (List[Tuple[int, int]]): List of hole card pairs.
-            community_cards (List[int]): Community cards.
-            num_players (int): Number of players.
-            num_simulations (int, optional): Number of simulations. Defaults to 1000.
+        Get information about the framework and device.
         
         Returns:
-            List[float]: Equity for each hand.
+            Dict[str, Any]: Framework and device information.
         """
-        # Placeholder for GPU-accelerated equity simulation
-        return [0.5 for _ in range(len(hole_cards))]
+        info = {
+            'framework': self.framework,
+            'use_gpu': self.use_gpu,
+            'device': str(self.device)
+        }
+        
+        if self.framework == "pytorch":
+            info['torch_version'] = torch.__version__
+            if self.torch_gpu_available:
+                info['gpu_name'] = torch.cuda.get_device_name(0)
+                info['gpu_count'] = torch.cuda.device_count()
+                info['cuda_version'] = torch.version.cuda
+        
+        elif self.framework == "tensorflow":
+            info['tensorflow_version'] = tf.__version__
+            if self.tf_gpu_available:
+                gpus = tf.config.list_physical_devices('GPU')
+                info['gpu_count'] = len(gpus)
+        
+        return info
 
 
-def batch_inference(model: nn.Module, inputs: List[np.ndarray], 
-                  device: Optional[torch.device] = None, 
-                  batch_size: int = 64) -> List[np.ndarray]:
+# Global instance for usage throughout the package
+_GPU_MANAGER = None
+
+
+def get_gpu_manager() -> GPUManager:
     """
-    Perform batch inference with a PyTorch model.
-    
-    Args:
-        model (nn.Module): PyTorch model.
-        inputs (List[np.ndarray]): List of input arrays.
-        device (Optional[torch.device], optional): Device to use. Defaults to None.
-        batch_size (int, optional): Batch size. Defaults to 64.
+    Get the global GPU manager instance.
     
     Returns:
-        List[np.ndarray]: Model outputs.
+        GPUManager: The global GPU manager instance.
     """
-    if device is None:
-        device = select_best_device()
-    
-    model = model.to(device)
-    model.eval()
-    
-    results = []
-    
-    with torch.no_grad():
-        for i in range(0, len(inputs), batch_size):
-            # Get batch
-            batch_inputs = inputs[i:i + batch_size]
-            
-            # Convert to tensors
-            batch_tensors = [torch.from_numpy(x).float().to(device) for x in batch_inputs]
-            
-            # Stack tensors
-            if all(x.shape == batch_tensors[0].shape for x in batch_tensors):
-                stacked_batch = torch.stack(batch_tensors)
-            else:
-                # If inputs have different shapes, process them individually
-                batch_outputs = []
-                for tensor in batch_tensors:
-                    output = model(tensor.unsqueeze(0)).cpu().numpy()
-                    batch_outputs.append(output.squeeze(0))
-                results.extend(batch_outputs)
-                continue
-            
-            # Process batch
-            outputs = model(stacked_batch)
-            
-            # Convert back to numpy and add to results
-            cpu_outputs = outputs.cpu().numpy()
-            results.extend([output for output in cpu_outputs])
-    
-    return results
+    global _GPU_MANAGER
+    if _GPU_MANAGER is None:
+        _GPU_MANAGER = GPUManager()
+    return _GPU_MANAGER
 
 
-class GPUProfiler:
+def execute_on_gpu(func):
     """
-    Profiler for GPU operations.
+    Decorator to execute a function on GPU if available.
     
-    This class provides utilities for profiling GPU operations
-    to help optimize performance.
-    
-    Attributes:
-        enabled (bool): Whether profiling is enabled.
+    Args:
+        func: Function to be executed on GPU.
+        
+    Returns:
+        Wrapped function that will execute on GPU if available.
     """
+    gpu_manager = get_gpu_manager()
     
-    def __init__(self, enabled: bool = True):
+    def wrapper(*args, **kwargs):
+        # Move tensor arguments to GPU if possible
+        gpu_args = []
+        for arg in args:
+            gpu_args.append(gpu_manager.to_device(arg))
+        
+        gpu_kwargs = {}
+        for key, value in kwargs.items():
+            gpu_kwargs[key] = gpu_manager.to_device(value)
+        
+        # Execute function
+        result = func(*gpu_args, **gpu_kwargs)
+        
+        # Move result back to CPU
+        return gpu_manager.from_device(result)
+    
+    return wrapper
+
+
+def time_execution(func):
+    """
+    Decorator to time the execution of a function.
+    
+    Args:
+        func: Function to be timed.
+        
+    Returns:
+        Wrapped function that will be timed.
+    """
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        logging.debug(f"Function {func.__name__} executed in {end_time - start_time:.4f} seconds")
+        return result
+    
+    return wrapper
+
+
+# Numba optimizations if available
+if HAS_NUMBA:
+    def optimize_with_numba(func):
         """
-        Initialize a GPU profiler.
+        Decorator to optimize a function with Numba.
         
         Args:
-            enabled (bool, optional): Whether profiling is enabled. Defaults to True.
-        """
-        self.enabled = enabled
-        
-        # Check if PyTorch profiler is available
-        self.has_profiler = hasattr(torch.profiler, 'profile')
-        
-        if self.enabled and not self.has_profiler:
-            logger.warning("PyTorch profiler not available. Using basic profiling.")
-    
-    def profile(self, func, *args, **kwargs):
-        """
-        Profile a function.
-        
-        Args:
-            func: Function to profile.
-            *args: Arguments to pass to the function.
-            **kwargs: Keyword arguments to pass to the function.
-        
+            func: Function to be optimized.
+            
         Returns:
-            Any: Function result.
+            Numba-optimized function.
         """
-        if not self.enabled:
-            return func(*args, **kwargs)
+        return numba.jit(nopython=True)(func)
+    
+    def optimize_with_cuda(func):
+        """
+        Decorator to optimize a function with CUDA via Numba.
         
-        if self.has_profiler:
-            with torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True
-            ) as prof:
-                result = func(*args, **kwargs)
+        Args:
+            func: Function to be optimized.
             
-            logger.info("GPU Profiling Results:")
-            logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-            
-            return result
+        Returns:
+            CUDA-optimized function if CUDA is available, otherwise the original function.
+        """
+        gpu_manager = get_gpu_manager()
+        
+        if HAS_CUDA and gpu_manager.use_gpu:
+            return cuda.jit(func)
         else:
-            # Basic profiling
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            
-            # Record start event
-            start.record()
-            
-            # Run function
-            result = func(*args, **kwargs)
-            
-            # Record end event
-            end.record()
-            
-            # Wait for events to complete
-            torch.cuda.synchronize()
-            
-            # Calculate time
-            elapsed_time = start.elapsed_time(end)
-            logger.info(f"Function execution time: {elapsed_time:.2f} ms")
-            
-            return result
+            return func
+else:
+    # Dummy decorators if Numba is not available
+    def optimize_with_numba(func):
+        """Dummy decorator when Numba is not available."""
+        return func
+    
+    def optimize_with_cuda(func):
+        """Dummy decorator when CUDA is not available."""
+        return func

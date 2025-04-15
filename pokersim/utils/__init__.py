@@ -1,10 +1,6 @@
 """
-Utils module for poker simulations.
+Utilities package for the poker simulator.
 
-This module includes utility functions and classes for poker simulations,
-such as optimization utilities and logging.
+This package provides various utility functions and classes for the poker
+simulator, including optimizations, logging, and common helper functions.
 """
-
-from pokersim.utils.optimization import njit_if_available
-
-__all__ = ["njit_if_available"]
