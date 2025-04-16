@@ -11,10 +11,13 @@ import random
 import numpy as np
 from collections import deque
 from typing import List, Dict, Tuple, Any, Optional
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    import torch.nn.functional as F
+except ImportError:
+    raise ImportError("PyTorch is required for NFSP implementation")
 
 from pokersim.game.state import GameState
 from pokersim.game.spingo import SpinGoGame

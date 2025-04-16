@@ -173,6 +173,8 @@ class CFRSolver:
         info_set_key = state.get_info_set_key()
         legal_actions = state.get_legal_actions()
         num_actions = len(legal_actions)
+        if num_actions == 0:
+            return np.array([])
         
         # Get strategy for this information set
         strategy = self.get_strategy(info_set_key, num_actions)

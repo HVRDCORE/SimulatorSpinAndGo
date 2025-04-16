@@ -49,11 +49,15 @@ class TorchAgent:
         """
         # Get feature vector
         features = game_state.to_feature_vector(player_id)
+        features = np.resize(features, 128)
         
         # Convert to tensor
         tensor = torch.tensor(features, dtype=torch.float32).to(self.device)
         
-        return tensor
+        return torch.tensor(features, dtype=torch.float32).to(self.device)
+
+        policy = torch.clamp(policy, -10, 10)
+        policy_probs = torch.softmax(policy, dim=1)
     
     def tensor_to_action(self, tensor: torch.Tensor, game_state: GameState) -> Action:
         """

@@ -14,6 +14,8 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
 
 from pokersim.game.state import GameState, Action, Stage
 

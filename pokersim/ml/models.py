@@ -142,6 +142,7 @@ class PolicyNetwork(nn.Module):
             torch.Tensor: Action probabilities.
         """
         policy_logits, _ = self.forward(x)
+        policy_logits = torch.clamp(policy_logits, -10, 10)
         return F.softmax(policy_logits, dim=-1)
     
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
@@ -315,6 +316,85 @@ class PokerTransformer(nn.Module):
         
         return policy_logits, value
 
+class PokerMLP(nn.Module):
+    """Multi-layer perceptron for poker decision making."""
+
+    def __init__(self, input_dim: int, hidden_dims: List[int], output_dim: int):
+        super().__init__()
+
+        layers = []
+        prev_dim = input_dim
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            prev_dim = hidden_dim
+
+        layers.append(nn.Linear(prev_dim, output_dim))
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+class PokerCNN(nn.Module):
+    """Convolutional neural network for poker decision making."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+
+        # Reshape input into 2D for convolution
+        self.width = int(input_dim ** 0.5)
+        while input_dim % self.width != 0:
+            self.width -= 1
+        self.height = input_dim // self.width
+
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2)
+
+        # Calculate flattened size
+        flat_size = 64 * (input_dim // 4)
+
+        self.fc1 = nn.Linear(flat_size, 512)
+        self.fc2 = nn.Linear(512, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Reshape input
+        x = x.unsqueeze(1)  # (batch, 1, input_dim)
+
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+
+class PokerActorCritic(nn.Module):
+    """Actor-critic network for poker decision making."""
+
+    def __init__(self, input_dim: int, action_dim: int):
+        super().__init__()
+
+        self.shared = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+
+        self.actor = nn.Linear(128, action_dim)
+        self.critic = nn.Linear(128, 1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.shared(x)
+        action_probs = self.actor(features)
+        value = self.critic(features)
+        return action_probs, value
 
 def create_value_network(input_size: int, hidden_layers: List[int], output_size: int = 1) -> ValueNetwork:
     """

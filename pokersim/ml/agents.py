@@ -145,7 +145,7 @@ class TorchMLAgent(MLAgent, TorchAgent):
             # Handle different model types
             if isinstance(self.model, PokerActorCritic):
                 policy, _ = self.model(state_tensor.unsqueeze(0))
-                policy = policy.squeeze(0)
+                policy = torch.clamp(policy, -10, 10)
             else:
                 policy = self.model(state_tensor.unsqueeze(0)).squeeze(0)
             
@@ -222,6 +222,9 @@ class DQNAgent(MLAgent):
         """
         # Get feature vector
         features = game_state.to_feature_vector(self.player_id)
+
+        features = np.resize(features, 128)
+        return torch.tensor(features, dtype=torch.float32).to(self.device)
         
         # Convert to tensor
         tensor = torch.tensor(features, dtype=torch.float32).to(self.device)

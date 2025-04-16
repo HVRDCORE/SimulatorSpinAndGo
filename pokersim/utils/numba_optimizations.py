@@ -84,13 +84,13 @@ def evaluate_hand_fast(cards: np.ndarray) -> Tuple[int, int]:
         return 0, 0
     
     # Extract ranks and suits
-    ranks = np.array([card // 4 for card in cards])
-    suits = np.array([card % 4 for card in cards])
+    ranks = cards // 4
+    suits = cards % 4
     
     # Count rank occurrences
     rank_counts = np.zeros(15, dtype=np.int32)
-    for rank in ranks:
-        rank_counts[rank] += 1
+    for i in range(len(ranks)):
+        rank_counts[ranks[i]] += 1
     
     # Sort cards by rank (descending)
     sorted_indices = np.argsort(-ranks)

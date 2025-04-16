@@ -5,6 +5,8 @@ from pokersim.game.spingo import SpinGoGame
 from pokersim.agents.random_agent import RandomAgent
 from pokersim.agents.rule_based_agent import RuleBased1Agent
 from pokersim.agents.advanced_opponent_agent import AdvancedOpponentAgent, AdvancedOpponentProfile
+from pokersim.agents.base_agent import Agent
+from pokersim.ml.agents import MLAgent
 
 @app.route('/')
 def index():

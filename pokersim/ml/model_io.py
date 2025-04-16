@@ -226,38 +226,27 @@ class ModelIO:
         model_path = os.path.join(model_dir, "model.keras")
         model.save(model_path)
         return model_path
-    
+
     def _load_pytorch_model(self, model_path: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
-        """
-        Load a PyTorch model.
-        
-        Args:
-            model_path (str): Path to the model file or directory.
-            metadata (Optional[Dict[str, Any]], optional): Model metadata. Defaults to None.
-        
-        Returns:
-            Any: Loaded PyTorch model.
-        """
-        if os.path.isdir(model_path):
-            # Look for model file in directory
-            model_file = os.path.join(model_path, "model.pt")
-            if not os.path.exists(model_file):
-                logger.error(f"No PyTorch model found in {model_path}")
-                return None
-        else:
-            model_file = model_path
-        
-        # Load model architecture if available
+        model_file = os.path.join(model_path, "model.pt") if os.path.isdir(model_path) else model_path
+        if not os.path.exists(model_file):
+            logger.error(f"No PyTorch model found in {model_path}")
+            return None
+
+        state_dict = torch.load(model_file, map_location=torch.device('cpu'))
+
         if metadata and "model_class" in metadata:
-            model_class = metadata["model_class"]
-            # This would require dynamic import, which is complex
-            # For simplicity, we'll return the state dict and let the caller handle it
-            state_dict = torch.load(model_file, map_location=torch.device('cpu'))
-            return state_dict
-        else:
-            # Just load the state dict
-            state_dict = torch.load(model_file, map_location=torch.device('cpu'))
-            return state_dict
+            from importlib import import_module
+            try:
+                model_class = getattr(import_module("pokersim.ml.models"), metadata["model_class"])
+                model = model_class(**metadata.get("model_args", {}))
+                model.load_state_dict(state_dict)
+                return model
+            except (ImportError, KeyError, AttributeError) as e:
+                logger.error(f"Failed to load model class: {e}")
+                return state_dict
+
+        return state_dict
     
     def _load_tensorflow_model(self, model_path: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         """

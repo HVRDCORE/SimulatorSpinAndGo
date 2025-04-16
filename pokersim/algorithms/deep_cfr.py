@@ -232,7 +232,7 @@ class DeepCFRSolver:
             inputs_tensor = torch.tensor(inputs, dtype=torch.float32)
             
             # Optimize for GPU if available
-            inputs_tensor = optimize_tensor_for_gpu(inputs_tensor)
+            inputs_tensor = inputs_tensor.to(self.device)
             
             # Forward pass
             with torch.no_grad():
@@ -246,7 +246,7 @@ class DeepCFRSolver:
             inputs_tensor = tf.convert_to_tensor(inputs, dtype=tf.float32)
             
             # Optimize for GPU if available
-            inputs_tensor = optimize_tensor_for_gpu(inputs_tensor)
+            inputs_tensor = tf.convert_to_tensor(inputs_tensor, dtype=tf.float32)
             
             # Forward pass
             outputs = network["network"](inputs_tensor, training=False)

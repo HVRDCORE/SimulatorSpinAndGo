@@ -162,15 +162,42 @@ class CUDAHandEvaluator:
                     suit = card % SUITS
                     rank_counts[batch_idx, rank] += 1
                     suit_counts[batch_idx, suit] += 1
-        
-        # Check for straight flush (highest hand rank)
-        # [Implementation would go here]
-        
-        # Check for four of a kind
-        # [Implementation would go here]
-        
-        # Check for full house
-        # [Implementation would go here]
+
+                # Check for straight flush (highest hand rank)
+                for batch_idx in range(batch_size):
+                    if has_flush[batch_idx]:
+                        flush_suit = flush_suits[batch_idx].item()
+                        flush_cards = []
+                        for card_idx in range(cards.shape[1]):
+                            if cards[batch_idx, card_idx] >= 0:
+                                card = cards[batch_idx, card_idx].item()
+                                if card % SUITS == flush_suit:
+                                    flush_cards.append(card // SUITS)
+                        flush_cards.sort(reverse=True)
+                        # Check for straight in flush cards
+                        for i in range(len(flush_cards) - 4):
+                            if flush_cards[i] - flush_cards[i + 4] == 4:
+                                hand_values[batch_idx] = 8000000 + flush_cards[i] * 10000
+                                break
+
+                # Check for four of a kind
+                has_quads = (rank_counts == 4).any(dim=1)
+                quads_ranks = torch.argmax((rank_counts == 4).float(), dim=1)
+
+                for batch_idx in range(batch_size):
+                    if has_quads[batch_idx]:
+                        hand_values[batch_idx] = 7000000 + quads_ranks[batch_idx].item() * 10000
+
+                # Check for full house
+                has_trips = (rank_counts == 3).any(dim=1)
+                has_pair = (rank_counts == 2).any(dim=1)
+                trips_ranks = torch.argmax((rank_counts == 3).float(), dim=1)
+                pair_ranks = torch.argmax((rank_counts == 2).float(), dim=1)
+
+                for batch_idx in range(batch_size):
+                    if has_trips[batch_idx] and has_pair[batch_idx]:
+                        hand_values[batch_idx] = 6000000 + trips_ranks[batch_idx].item() * 10000 + pair_ranks[
+                            batch_idx].item()
         
         # Check for flush
         has_flush = (suit_counts >= 5).any(dim=1)
@@ -183,9 +210,58 @@ class CUDAHandEvaluator:
                 
                 # Set hand value for flush
                 hand_values[batch_idx] = 5000000  # Base value for flush
-        
-        # Check for straight
-        # [Implementation would go here]
+
+                # Check for straight
+                straight_high = -1
+                for i in range(10):  # Check from Ace high down to 5 high
+                    high_card = RANKS - i - 1
+                    consecutive = 0
+                    for j in range(5):
+                        if rank_counts[high_card - j] > 0:
+                            consecutive += 1
+                        else:
+                            break
+                    if consecutive == 5:
+                        straight_high = high_card
+                        break
+
+                # Special case: Ace-low straight (A-2-3-4-5)
+                if straight_high == -1:
+                    if rank_counts[12] > 0:  # Ace
+                        consecutive = 1
+                        for j in range(4):
+                            if rank_counts[j] > 0:
+                                consecutive += 1
+                        if consecutive == 5:
+                            straight_high = 3  # 5-high straight
+
+                if straight_high != -1:
+                    hand_values[batch_idx] = 4000000 + straight_high * 10000
+
+                # Check for two pair
+                pairs = torch.where(rank_counts == 2)[0]
+                if len(pairs) >= 2:
+                    pairs_sorted = torch.sort(pairs, descending=True)[0]
+                    high_pair = pairs_sorted[0]
+                    second_pair = pairs_sorted[1]
+                    remaining_cards = torch.where(rank_counts == 1)[0]
+                    kicker = remaining_cards[-1] if len(remaining_cards) > 0 else 0
+                    hand_values[batch_idx] = 2000000 + high_pair * 10000 + second_pair * 100 + kicker
+
+                # Check for one pair
+                elif len(pairs) == 1:
+                    pair_rank = pairs[0]
+                    kickers = torch.where(rank_counts == 1)[0]
+                    kickers_sorted = torch.sort(kickers, descending=True)[0]
+                    kicker_value = sum(
+                        kickers_sorted[i].item() * (100 ** (2 - i)) for i in range(min(3, len(kickers_sorted))))
+                    hand_values[batch_idx] = 1000000 + pair_rank * 10000 + kicker_value
+
+                # High card
+                else:
+                    high_cards = torch.sort(torch.where(rank_counts == 1)[0], descending=True)[0]
+                    hand_value = sum(high_cards[i].item() * (100 ** (4 - i)) for i in range(min(5, len(high_cards))))
+                    hand_values[batch_idx] = hand_value
         
         # Check for three of a kind
         has_trips = (rank_counts == 3).any(dim=1)
@@ -195,9 +271,7 @@ class CUDAHandEvaluator:
             if has_trips[batch_idx] and not has_flush[batch_idx]:  # Skip if already has better hand
                 # Set hand value for three of a kind
                 hand_values[batch_idx] = 3000000 + trips_ranks[batch_idx].item() * 10000
-        
-        # Check for two pair, one pair, high card
-        # [Implementation would go here]
+    
         
         return hand_values
 

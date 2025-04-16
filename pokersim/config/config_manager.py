@@ -8,7 +8,12 @@ and supports hierarchical configuration with defaults.
 
 import os
 import json
-import yaml
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+    logger.warning("PyYAML not installed. YAML configuration files will not be supported.")
 import argparse
 from typing import Dict, Any, Optional, List, Union
 import logging
@@ -43,11 +48,11 @@ class ConfigManager:
         
         # Default configuration search paths
         if config_paths is None:
-            self.config_paths = [
-                "./config",
-                "~/.pokersim",
-                "/etc/pokersim"
-            ]
+            self.config_paths = ["./config", "~/.pokersim"]
+            if os.access("/etc/pokersim", os.R_OK):
+                self.config_paths.append("/etc/pokersim")
+            else:
+                logger.warning("Skipping /etc/pokersim due to insufficient permissions")
         else:
             self.config_paths = config_paths
         
@@ -134,7 +139,12 @@ class ConfigManager:
             "collect_stats": True,    # Whether to collect statistics
             "export_interval": 100    # Interval for exporting data
         }
-    
+
+        os.makedirs(self.config["general"]["data_dir"], exist_ok=True)
+        os.makedirs(self.config["agents"]["save_dir"], exist_ok=True)
+        self._setup_logging()
+        logger.info("Configuration loaded successfully")
+
     def load_from_file(self, filepath: str) -> bool:
         """
         Load configuration from a file.
@@ -154,8 +164,11 @@ class ConfigManager:
             
             # Determine file format based on extension
             ext = path.suffix.lower()
-            
+
             if ext in ['.yaml', '.yml']:
+                if not YAML_AVAILABLE:
+                    logger.error("YAML support is not available. Install PyYAML.")
+                    return False
                 with open(path, 'r') as f:
                     config_data = yaml.safe_load(f)
             elif ext in ['.json']:
@@ -173,32 +186,27 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"Error loading configuration from {filepath}: {e}")
             return False
-    
+
     def load_from_env(self, prefix: str = "POKERSIM_"):
-        """
-        Load configuration from environment variables.
-        
-        Args:
-            prefix (str, optional): Prefix for environment variables. Defaults to "POKERSIM_".
-        """
-        # Find all environment variables with the specified prefix
         for key, value in os.environ.items():
             if key.startswith(prefix):
-                # Remove prefix and convert to lowercase
                 config_key = key[len(prefix):].lower()
-                
-                # Split by double underscore to create hierarchy
                 parts = config_key.split("__")
-                
-                # Try to parse the value
                 try:
-                    # Try to parse as JSON
+                    # Try JSON parsing
                     parsed_value = json.loads(value)
                 except json.JSONDecodeError:
-                    # If not valid JSON, use as string
-                    parsed_value = value
-                
-                # Update configuration
+                    # Handle common string values
+                    if value.lower() == "true":
+                        parsed_value = True
+                    elif value.lower() == "false":
+                        parsed_value = False
+                    elif value.isdigit():
+                        parsed_value = int(value)
+                    elif value.replace(".", "", 1).isdigit():
+                        parsed_value = float(value)
+                    else:
+                        parsed_value = value
                 self._set_config_value(parts, parsed_value)
         
         logger.info(f"Loaded configuration from environment variables with prefix {prefix}")
@@ -301,20 +309,14 @@ class ConfigManager:
         # Configure root logger
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
-        
-        # Remove existing handlers
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-        
-        # Add new handler
-        if log_file:
-            handler = logging.FileHandler(log_file)
-        else:
-            handler = logging.StreamHandler()
-        
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
+
+        # Only reconfigure if no handlers are set or explicitly needed
+        if not root_logger.handlers:
+            root_logger.setLevel(log_level)
+            handler = logging.FileHandler(log_file) if log_file else logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
     
     def _update_config(self, config_data: Dict[str, Any]):
         """

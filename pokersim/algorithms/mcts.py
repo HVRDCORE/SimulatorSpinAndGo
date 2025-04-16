@@ -72,6 +72,8 @@ class MCTSNode:
         """
         # Get observation from the player's perspective
         obs = self.state.get_observation(self.player_id)
+        if not isinstance(obs, dict):
+            raise ValueError("Observation must be a dictionary")
         
         # Create a string representation of the observation
         info_set_parts = []
@@ -184,10 +186,8 @@ class MCTSNode:
         Returns:
             Any: The best action.
         """
-        if not self.children:
-            if self.untried_actions:
-                return random.choice(self.untried_actions)
-            return None
+        if not self.children and not self.untried_actions:
+            raise ValueError("No actions available")
         
         if exploration:
             # Use UCB for selection during search

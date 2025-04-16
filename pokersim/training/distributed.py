@@ -70,9 +70,9 @@ class DistributedTrainer:
         
         # Set world size (number of processes)
         if world_size is None:
-            self.world_size = self.config["training"]["num_workers"]
+            self.world_size = max(1, self.config["training"]["num_workers"])
         else:
-            self.world_size = world_size
+            self.world_size = max(1, world_size)
         
         # Set framework
         if framework == "auto":
@@ -153,8 +153,15 @@ class DistributedTrainer:
             Any: Results from the training function.
         """
         # Initialize distributed process group
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(find_free_port())
+        for attempt in range(3):
+            try:
+                os.environ["MASTER_PORT"] = str(find_free_port())
+                mp.spawn(wrapped_fn, nprocs=self.world_size, join=True)
+                break
+            except RuntimeError as e:
+                logger.warning(f"Port conflict on attempt {attempt + 1}: {e}")
+                if attempt == 2:
+                    raise
         
         # Prepare arguments for each process
         wrapped_fn = partial(self._pytorch_worker_fn, training_fn, *args, **kwargs)
@@ -183,7 +190,7 @@ class DistributedTrainer:
         """
         # Initialize distributed process group
         dist.init_process_group(
-            backend="nccl" if self.gpu_manager.use_gpu else "gloo",
+            backend = "nccl" if self.gpu_manager.use_gpu and torch.cuda.is_available() else "gloo",
             init_method=f"env://",
             world_size=self.world_size,
             rank=rank
@@ -273,7 +280,11 @@ class DistributedTrainer:
             List[Any]: List of results from all processes.
         """
         # Convert results to JSON string for transmission
-        local_json = json.dumps(local_results)
+        try:
+            local_json = json.dumps(local_results)
+        except TypeError:
+            logger.error(f"Cannot serialize results at rank {rank}")
+            local_json = json.dumps({"error": "Serialization failed"})
         local_tensor = torch.tensor(bytearray(local_json.encode()), dtype=torch.uint8)
         
         # Get size of each result tensor

@@ -330,12 +330,15 @@ class TFAgent(Agent):
         """
         # Get feature vector
         features = game_state.to_feature_vector(self.player_id)
+        features = np.resize(features, 128)
         
         # Convert to tensor
         tensor = tf.convert_to_tensor(features, dtype=tf.float32)
         tensor = tf.expand_dims(tensor, axis=0)
         
-        return tensor
+        return tf.expand_dims(tensor, axis=0)
+
+        policy_logits = tf.clip_by_value(policy_logits, -10, 10)
     
     def tensor_to_action(self, tensor: tf.Tensor, game_state: GameState) -> Action:
         """
