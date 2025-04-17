@@ -87,19 +87,20 @@ class GameState:
     Состояние покерной игры в формате Spin and Go.
 
     Атрибуты:
-        num_players (int): Количество игроков в игре (по умолчанию 3 для Spin and Go).
+        num_players (int): Количество игроков в раздаче.
         small_blind (int): Размер малого блайнда.
         big_blind (int): Размер большого блайнда.
-        stacks (List[int]): Стек фишек каждого игрока (фиксирован на 500).
+        stacks (List[int]): Стеки фишек каждого игрока.
+        player_ids (List[int]): Глобальные идентификаторы игроков.
         deck (Deck): Колода карт.
         hole_cards (List[List[Card]]): Приватные карты каждого игрока.
         community_cards (List[Card]): Общие карты.
         pot (int): Размер банка.
         current_bets (List[int]): Текущие ставки каждого игрока.
         stage (Stage): Текущая стадия игры.
-        button (int): Игрок с баттоном дилера.
-        current_player (int): Игрок, который должен действовать.
-        last_raiser (int): Последний игрок, сделавший рейз.
+        button (int): Индекс игрока с баттоном дилера (в списке player_ids).
+        current_player (int): Глобальный ID игрока, который должен действовать.
+        last_raiser (int): Глобальный ID последнего игрока, сделавшего рейз.
         min_raise (int): Минимальная сумма рейза.
         active (List[bool]): Активность игроков (не сбросили карты).
         history (List[Tuple[int, Action]]): История действий.
@@ -107,32 +108,41 @@ class GameState:
         payouts (List[int]): Выплаты каждому игроку в конце раздачи.
     """
 
-    def __init__(self, num_players: int = 3, small_blind: int = 5, big_blind: int = 10,
-                 initial_stacks: List[int] = None, button: int = 0):
+    def __init__(
+        self,
+        num_players: int,
+        small_blind: int,
+        big_blind: int,
+        initial_stacks: List[int],
+        button: int,
+        player_ids: List[int]
+    ):
         """
         Инициализация состояния игры.
 
         Аргументы:
-            num_players (int, optional): Количество игроков. По умолчанию 3.
-            small_blind (int, optional): Размер малого блайнда. По умолчанию 5.
-            big_blind (int, optional): Размер большого блайнда. По умолчанию 10.
-            initial_stacks (List[int], optional): Начальные стеки. Игнорируется, фиксировано 500.
-            button (int, optional): Игрок с баттоном дилера. По умолчанию 0.
+            num_players (int): Количество игроков.
+            small_blind (int): Размер малого блайнда.
+            big_blind (int): Размер большого блайнда.
+            initial_stacks (List[int]): Начальные стеки игроков.
+            button (int): Индекс игрока с баттоном дилера (в списке player_ids).
+            player_ids (List[int]): Глобальные идентификаторы игроков.
         """
+        if len(initial_stacks) != num_players or len(player_ids) != num_players:
+            raise ValueError("Length of initial_stacks and player_ids must match num_players")
+
         self.num_players = num_players
         self.small_blind = small_blind
         self.big_blind = big_blind
-
-        # Фиксированные стеки для Spin and Go
-        self.stacks = [500] * num_players
-
+        self.stacks = initial_stacks.copy()
+        self.player_ids = player_ids.copy()
         self.deck = Deck()
         self.hole_cards = [[] for _ in range(num_players)]
         self.community_cards = []
         self.pot = 0
         self.current_bets = [0] * num_players
         self.stage = Stage.PREFLOP
-        self.button = button
+        self.button = button % num_players  # Ensure button is valid
         self.active = [True] * num_players
         self.last_raiser = -1
         self.min_raise = big_blind
@@ -152,7 +162,8 @@ class GameState:
     def _deal_hole_cards(self) -> None:
         """Раздача приватных карт каждому игроку."""
         for i in range(self.num_players):
-            self.hole_cards[i] = self.deck.deal(2)
+            if self.stacks[i] > 0:
+                self.hole_cards[i] = self.deck.deal(2)
 
     def _post_blinds(self) -> None:
         """Постановка блайндов."""
@@ -164,32 +175,33 @@ class GameState:
         self.stacks[sb_pos] -= sb_amount
         self.current_bets[sb_pos] = sb_amount
         self.pot += sb_amount
-        self.history.append((sb_pos, Action(ActionType.BET, sb_amount)))
-        self.stage_history[0].append((sb_pos, Action(ActionType.BET, sb_amount)))
+        self.history.append((self.player_ids[sb_pos], Action(ActionType.BET, sb_amount)))
+        self.stage_history[0].append((self.player_ids[sb_pos], Action(ActionType.BET, sb_amount)))
 
         # Большой блайнд
         bb_amount = min(self.big_blind, self.stacks[bb_pos])
         self.stacks[bb_pos] -= bb_amount
         self.current_bets[bb_pos] = bb_amount
         self.pot += bb_amount
-        self.history.append((bb_pos, Action(ActionType.BET, bb_amount)))
-        self.stage_history[0].append((bb_pos, Action(ActionType.BET, bb_amount)))
+        self.history.append((self.player_ids[bb_pos], Action(ActionType.BET, bb_amount)))
+        self.stage_history[0].append((self.player_ids[bb_pos], Action(ActionType.BET, bb_amount)))
 
-        self.last_raiser = bb_pos
+        self.last_raiser = self.player_ids[bb_pos]
 
     def _first_to_act(self) -> int:
         """Определение первого игрока для действия."""
         pos = (self.button + 3) % self.num_players  # После блайндов на префлопе
         while not self.active[pos] or self.stacks[pos] == 0:
             pos = (pos + 1) % self.num_players
-        return pos
+        return self.player_ids[pos]
 
     def _next_player(self) -> int:
         """Определение следующего игрока для действия."""
+        current_idx = self.player_ids.index(self.current_player)
         for i in range(1, self.num_players):
-            p = (self.current_player + i) % self.num_players
-            if self.active[p] and self.stacks[p] > 0:
-                return p
+            pos = (current_idx + i) % self.num_players
+            if self.active[pos] and self.stacks[pos] > 0:
+                return self.player_ids[pos]
         return -1  # Нет активных игроков
 
     def _stage_complete(self) -> bool:
@@ -208,8 +220,8 @@ class GameState:
 
         # Проверка, что все игроки действовали после последнего рейза
         if self.last_raiser != -1:
-            last_action_pos = self.history[-1][0] if self.history else -1
-            if last_action_pos != self.last_raiser:
+            last_action_id = self.history[-1][0] if self.history else -1
+            if last_action_id != self.last_raiser:
                 return False
 
         return True
@@ -218,7 +230,7 @@ class GameState:
         """Переход к следующей стадии игры."""
         # Перемещение ставок в банк
         self.pot += sum(self.current_bets)
-        self.current_bets = [0] * self.num_players
+        self.current_bets = [0] * num_players
 
         # Сброс последнего рейзера и минимального рейза
         self.last_raiser = -1
@@ -244,9 +256,9 @@ class GameState:
     def _showdown(self) -> None:
         """Определение победителя на шоудауне."""
         if sum(self.active) <= 1:
-            winner = self.active.index(True) if True in self.active else -1
-            if winner != -1:
-                self.payouts[winner] = self.pot
+            winner_idx = self.active.index(True) if True in self.active else -1
+            if winner_idx != -1:
+                self.payouts[winner_idx] = self.pot
             return
 
         active_players = [i for i, active in enumerate(self.active) if active]
@@ -293,14 +305,16 @@ class GameState:
         """
         if (self.current_player == -1 or
             self.stage == Stage.SHOWDOWN or
-            not self.active[self.current_player] or
-            self.stacks[self.current_player] <= 0):
+            self.current_player not in self.player_ids or
+            not self.active[self.player_ids.index(self.current_player)] or
+            self.stacks[self.player_ids.index(self.current_player)] <= 0):
             return []
 
+        player_idx = self.player_ids.index(self.current_player)
         actions = []
         max_bet = max(self.current_bets) if self.current_bets else 0
-        current_bet = self.current_bets[self.current_player]
-        stack = self.stacks[self.current_player]
+        current_bet = self.current_bets[player_idx]
+        stack = self.stacks[player_idx]
 
         # Фолд всегда легален, если игрок активен
         actions.append(Action(ActionType.FOLD))
@@ -317,16 +331,21 @@ class GameState:
 
         # Бет легален, если никто не сделал ставку
         if max_bet == 0 and stack > 0:
-            actions.append(Action(ActionType.BET, min(self.big_blind, stack)))
-            if stack > self.big_blind:
-                actions.append(Action(ActionType.BET, stack))
+            min_bet = min(self.big_blind, stack)
+            actions.append(Action(ActionType.BET, min_bet))
+            # Добавляем среднюю ставку (половина стека), если стек позволяет
+            half_stack = stack // 2
+            if half_stack > min_bet:
+                actions.append(Action(ActionType.BET, half_stack))
 
         # Рейз легален, если есть ставка и у игрока достаточно фишек
         if max_bet > 0 and stack > (max_bet - current_bet):
             min_raise_amount = min(self.min_raise + max_bet, stack)
             actions.append(Action(ActionType.RAISE, min_raise_amount))
-            if stack > min_raise_amount:
-                actions.append(Action(ActionType.RAISE, stack))
+            # Добавляем удвоенный минимальный рейз, если стек позволяет
+            double_min_raise = min(2 * min_raise_amount, stack)
+            if double_min_raise > min_raise_amount:
+                actions.append(Action(ActionType.RAISE, double_min_raise))
 
         return actions
 
@@ -347,39 +366,39 @@ class GameState:
             raise ValueError(f"Нелегальное действие: {action}")
 
         new_state = copy.deepcopy(self)
-        player = new_state.current_player
+        player_idx = new_state.player_ids.index(new_state.current_player)
 
         if action.action_type == ActionType.FOLD:
-            new_state.active[player] = False
+            new_state.active[player_idx] = False
 
         elif action.action_type == ActionType.CHECK:
             pass
 
         elif action.action_type == ActionType.CALL:
-            call_amount = min(max(new_state.current_bets) - new_state.current_bets[player],
-                              new_state.stacks[player])
-            new_state.stacks[player] -= call_amount
-            new_state.current_bets[player] += call_amount
+            call_amount = min(max(new_state.current_bets) - new_state.current_bets[player_idx],
+                              new_state.stacks[player_idx])
+            new_state.stacks[player_idx] -= call_amount
+            new_state.current_bets[player_idx] += call_amount
             new_state.pot += call_amount
 
         elif action.action_type == ActionType.BET:
-            new_state.stacks[player] -= action.amount
-            new_state.current_bets[player] = action.amount
+            new_state.stacks[player_idx] -= action.amount
+            new_state.current_bets[player_idx] = action.amount
             new_state.pot += action.amount
-            new_state.last_raiser = player
+            new_state.last_raiser = new_state.current_player
             new_state.min_raise = action.amount
 
         elif action.action_type == ActionType.RAISE:
-            additional_amount = action.amount - new_state.current_bets[player]
-            new_state.stacks[player] -= additional_amount
-            new_state.current_bets[player] = action.amount
+            additional_amount = action.amount - new_state.current_bets[player_idx]
+            new_state.stacks[player_idx] -= additional_amount
+            new_state.current_bets[player_idx] = action.amount
             new_state.pot += additional_amount
-            new_state.last_raiser = player
+            new_state.last_raiser = new_state.current_player
             new_state.min_raise = action.amount - max(new_state.current_bets)
 
         # Запись действия в историю
-        new_state.history.append((player, action))
-        new_state.stage_history[new_state.stage.value - 1].append((player, action))
+        new_state.history.append((new_state.current_player, action))
+        new_state.stage_history[new_state.stage.value - 1].append((new_state.current_player, action))
 
         # Обновление текущего игрока
         new_state.current_player = new_state._next_player()
@@ -410,13 +429,14 @@ class GameState:
         Возвращает:
             Dict[str, Any]: Наблюдение.
         """
+        player_idx = self.player_ids.index(player_id) if player_id in self.player_ids else -1
         observation = {
             'player_id': player_id,
             'num_players': self.num_players,
             'small_blind': self.small_blind,
             'big_blind': self.big_blind,
             'stacks': self.stacks,
-            'hole_cards': self.hole_cards[player_id] if 0 <= player_id < self.num_players else [],
+            'hole_cards': self.hole_cards[player_idx] if player_idx != -1 else [],
             'community_cards': self.community_cards,
             'pot': self.pot,
             'current_bets': self.current_bets,
@@ -427,7 +447,6 @@ class GameState:
             'history': self.history,
             'legal_actions': self.get_legal_actions() if self.current_player == player_id else []
         }
-
         return observation
 
     def get_payouts(self) -> List[int]:
@@ -450,8 +469,8 @@ class GameState:
             return [0.0] * self.num_players
 
         rewards = [0.0] * self.num_players
-        for i, payout in enumerate(self.payouts):
-            rewards[i] = float(payout - self.current_bets[i])
+        for i in range(self.num_players):
+            rewards[i] = float(self.payouts[i] - self.current_bets[i])
         return rewards
 
     def to_feature_vector(self, player_id: int) -> np.ndarray:
@@ -464,23 +483,13 @@ class GameState:
         Возвращает:
             np.ndarray: Вектор признаков.
         """
-        # Признаки:
-        # - One-hot кодирование приватных карт (2 карты x 52 варианта)
-        # - One-hot кодирование общих карт (5 карт x 52 варианта)
-        # - Размер банка (нормализован)
-        # - Размеры стеков (нормализованы для каждого игрока)
-        # - Текущие ставки (нормализованы для каждого игрока)
-        # - Стадия игры (one-hot кодирование)
-        # - Позиция баттона (one-hot кодирование)
-        # - Текущий игрок (one-hot кодирование)
-        # - Активные игроки (бинарно для каждого игрока)
-
         total_chips = max(sum(self.stacks) + self.pot, 1)
 
         # One-hot кодирование приватных карт
         hole_cards_features = np.zeros(2 * 52)
-        if 0 <= player_id < self.num_players:
-            for i, card in enumerate(self.hole_cards[player_id]):
+        player_idx = self.player_ids.index(player_id) if player_id in self.player_ids else -1
+        if player_idx != -1:
+            for i, card in enumerate(self.hole_cards[player_idx]):
                 hole_cards_features[i * 52 + card.to_int()] = 1
 
         # One-hot кодирование общих карт
@@ -508,7 +517,8 @@ class GameState:
         # Текущий игрок (one-hot кодирование)
         current_player_features = np.zeros(self.num_players)
         if self.current_player != -1:
-            current_player_features[self.current_player] = 1
+            current_player_idx = self.player_ids.index(self.current_player)
+            current_player_features[current_player_idx] = 1
 
         # Активные игроки (бинарно для каждого игрока)
         active_features = np.array([1 if active else 0 for active in self.active])
@@ -536,10 +546,11 @@ class GameState:
         s += "Игроки:\n"
 
         for i in range(self.num_players):
-            s += f"  Игрок {i}: "
+            player_id = self.player_ids[i]
+            s += f"  Игрок {player_id}: "
             if i == self.button:
                 s += "(Баттон) "
-            if i == self.current_player:
+            if player_id == self.current_player:
                 s += "(Ходит) "
             s += f"Стек: {self.stacks[i]} "
             s += f"Ставка: {self.current_bets[i]} "
