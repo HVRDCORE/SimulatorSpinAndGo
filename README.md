@@ -1,22 +1,70 @@
-# PokerSim: Python Poker Simulation API with ML Integration
+# PokerSim: Python Poker Simulation Framework
 
-PokerSim is a comprehensive Python API for poker simulation with machine learning integration, advanced opponent agents, and optimization for reinforcement learning research.
+A comprehensive Python framework for poker simulation, machine learning research, and game theory exploration, featuring advanced opponent modeling and performance optimizations.
 
-[![Python Version](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.8%2B-red)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+## Features
 
-## Key Features
+- **Game Engine**: Complete Texas Hold'em poker engine with various betting structures
+- **Agent System**: Multiple agent types from basic to advanced ML-based agents
+- **ML Integration**: PyTorch integration for deep learning and neural networks
+- **Performance Optimization**: High-performance computing with GPU acceleration
+- **Flexible API**: Easy-to-use interface for custom agent development
 
-- **Complete Game Engine**: Fully implemented Texas Hold'em poker engine with support for different betting structures and game variants
-- **Machine Learning Integration**: Seamless integration with PyTorch for training and deploying ML-based poker agents
-- **Advanced Opponent Agents**: Various opponent models from basic rule-based to sophisticated neural network-based agents
-- **Reinforcement Learning Algorithms**: Implementation of Deep CFR and PPO for training strong poker agents
-- **Performance Optimization**: Numba-accelerated code for high-performance simulations
-- **Flexible API**: Comprehensive, well-documented API for custom agent development and game customization
-- **Extensive Tests**: Thorough test suite ensuring correctness of game mechanics and algorithms
+## Quick Start
 
-## Installation
+1. **Installation**
+   All dependencies are automatically installed through pyproject.toml.
 
-```bash
-pip install pokersim
+2. **Running Examples**
+   - Basic game simulation:
+   ```bash
+   python examples/basic_game.py
+   ```
+   
+   - Advanced usage examples:
+   ```bash
+   python examples/advanced_usage.py --all
+   ```
+   
+   - Train an ML agent:
+   ```bash
+   python examples/train_ppo.py
+   ```
+
+3. **Web Interface**
+   Start the web interface for visualization and monitoring:
+   ```bash
+   python main.py
+   ```
+   Access the interface at: https://{repl-name}.{username}.repl.co
+
+## Project Structure
+
+- `pokersim/`: Core framework modules
+- `examples/`: Example scripts and tutorials
+- `docs/`: Documentation and API reference
+- `tests/`: Unit and integration tests
+
+## Usage Examples
+
+```python
+from pokersim.game.state import GameState
+from pokersim.agents.random_agent import RandomAgent
+
+# Create a simple game with random agents
+game = GameState(num_players=2)
+agents = [RandomAgent() for _ in range(2)]
+
+# Run a single hand
+game.play_hand(agents)
+```
+
+## Documentation
+
+- Full API documentation: See `docs/api_reference.md`
+- Getting started guide: See `docs/getting_started.md`
+- Example tutorials: Browse the `examples/` directory
+
+## Contributing
+
+Feel free to fork this template and customize it for your needs. Bug reports and pull requests are welcome.
