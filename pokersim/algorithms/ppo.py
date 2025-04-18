@@ -1,9 +1,9 @@
 """
 Proximal Policy Optimization (PPO) algorithm for poker simulation.
 
-This module implements PPO, a state-of-the-art reinforcement learning algorithm,
-for training poker agents. PPO offers stable learning with good sample efficiency
-and is effective for environments with continuous action spaces.
+Этот модуль реализует алгоритм PPO, современный метод обучения с подкреплением,
+для тренировки агентов в покере. PPO обеспечивает стабильное обучение с хорошей
+эффективностью использования выборок и подходит для сред с непрерывным пространством действий.
 """
 
 import numpy as np
@@ -12,6 +12,7 @@ import time
 from typing import Dict, List, Tuple, Any, Optional, Callable
 import os
 
+# Попытка импорта PyTorch
 try:
     import torch
     import torch.nn as nn
@@ -22,6 +23,7 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+# Попытка импорта TensorFlow
 try:
     import tensorflow as tf
     from tensorflow.keras import layers, models, optimizers
@@ -29,45 +31,46 @@ try:
 except ImportError:
     HAS_TF = False
 
+# Проверка наличия хотя бы одного фреймворка
 if not HAS_TORCH and not HAS_TF:
-    raise ImportError("Either PyTorch or TensorFlow is required for PPO implementation")
-
+    raise ImportError("Для реализации PPO требуется либо PyTorch, либо TensorFlow")
 
 class PPOSolver:
     """
-    Proximal Policy Optimization (PPO) solver for poker games.
+    Решатель Proximal Policy Optimization (PPO) для покерных игр.
 
-    Attributes:
-        config (Dict[str, Any]): Configuration settings.
-        game_state_class: Class for creating game states.
-        framework (str): Deep learning framework being used ('pytorch' or 'tensorflow').
-        actor_network: Policy network.
-        critic_network: Value network.
-        actor_optimizer: Optimizer for the policy network.
-        critic_optimizer: Optimizer for the value network.
-        trajectory_buffer: Storage for experience data.
-        device: Device to run computations (CPU/GPU).
-        iterations (int): Number of training iterations performed.
+    Атрибуты:
+        game_state_class: Класс для создания игровых состояний.
+        num_players (int): Количество игроков в игре.
+        framework (str): Используемый фреймворк глубокого обучения ('pytorch' или 'tensorflow').
+        actor_network: Сеть политики.
+        critic_network: Сеть ценности.
+        actor_optimizer: Оптимизатор для сети политики.
+        critic_optimizer: Оптимизатор для сети ценности.
+        device: Устройство для вычислений (CPU/GPU).
+        iterations (int): Количество выполненных итераций обучения.
     """
 
     def __init__(self, game_state_class: Any, num_players: int = 2, framework: str = "auto"):
         self.game_state_class = game_state_class
         self.num_players = num_players
 
+        # Определение фреймворка
         if framework == "auto":
             if HAS_TORCH:
                 self.framework = "pytorch"
             elif HAS_TF:
                 self.framework = "tensorflow"
             else:
-                raise ImportError("No supported ML framework found")
+                raise ImportError("Не найден поддерживаемый ML-фреймворк")
         else:
             if framework == "pytorch" and not HAS_TORCH:
-                raise ImportError("PyTorch requested but not installed")
+                raise ImportError("Запрошен PyTorch, но он не установлен")
             elif framework == "tensorflow" and not HAS_TF:
-                raise ImportError("TensorFlow requested but not installed")
+                raise ImportError("Запрошен TensorFlow, но он не установлен")
             self.framework = framework
 
+        # Инициализация временного игрового состояния для определения размеров входа/выхода
         temp_state = self.game_state_class(
             num_players=self.num_players,
             small_blind=1,
@@ -81,16 +84,19 @@ class PPOSolver:
         self.input_dim = feature_vector.shape[0]
         self.output_dim = len(temp_state.get_legal_actions())
 
+        # Инициализация компонентов в зависимости от фреймворка
         if self.framework == "pytorch":
             self._init_pytorch_components()
         else:
             self._init_tensorflow_components()
 
+        # Гиперпараметры
         self.clip_ratio = 0.2
         self.entropy_coef = 0.01
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
 
+        # Буфер траекторий
         self.trajectory_buffer = {
             'states': [],
             'actions': [],
@@ -106,7 +112,7 @@ class PPOSolver:
 
     def _init_pytorch_components(self):
         if not HAS_TORCH:
-            raise ImportError("PyTorch is not installed")
+            raise ImportError("PyTorch не установлен")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.actor_network = ActorNetworkPyTorch(self.input_dim, 128, self.output_dim).to(self.device)
         self.critic_network = CriticNetworkPyTorch(self.input_dim, 128).to(self.device)
@@ -115,11 +121,11 @@ class PPOSolver:
 
     def _init_tensorflow_components(self):
         if not HAS_TF:
-            raise ImportError("TensorFlow is not installed")
+            raise ImportError("TensorFlow не установлен")
         self.actor_network = ActorNetworkTensorFlow(self.input_dim, 128, self.output_dim)
         self.critic_network = CriticNetworkTensorFlow(self.input_dim, 128)
-        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4)
-        self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+        self.actor_optimizer = optimizers.Adam(learning_rate=3e-4)
+        self.critic_optimizer = optimizers.Adam(learning_rate=1e-3)
         gpus = tf.config.list_physical_devices('GPU')
         self.device = "/GPU:0" if gpus else "/CPU:0"
 
@@ -153,7 +159,7 @@ class PPOSolver:
         try:
             return legal_actions.index(action)
         except ValueError:
-            return 0  # Fallback to first action
+            return 0  # Возврат к первому действию
 
     def get_action(self, state: Any, player_id: int, deterministic: bool = False) -> Tuple[Any, float, float]:
         state_vec = state.to_feature_vector(player_id).reshape(1, -1)
@@ -162,7 +168,8 @@ class PPOSolver:
 
         legal_actions = state.get_legal_actions()
         if len(legal_actions) > self.output_dim:
-            raise ValueError(f"Number of legal actions ({len(legal_actions)}) exceeds output dimension ({self.output_dim})")
+            raise ValueError(
+                f"Количество допустимых действий ({len(legal_actions)}) превышает размер выхода ({self.output_dim})")
 
         legal_mask = np.zeros(self.output_dim)
         for i in range(min(len(legal_actions), len(legal_mask))):
@@ -173,6 +180,18 @@ class PPOSolver:
             masked_probs = masked_probs / np.sum(masked_probs)
         else:
             masked_probs = legal_mask / np.sum(legal_mask)
+
+        # Добавляем эвристику: увеличиваем вероятность Raise/Bet для сильных рук
+        hole_cards = state.hole_cards[state.player_ids.index(player_id)]
+        if len(hole_cards) == 2 and state.stage == Stage.PREFLOP:
+            rank1, rank2 = hole_cards[0].rank.value, hole_cards[1].rank.value
+            suited = hole_cards[0].suit == hole_cards[1].suit
+            hand_strength = (rank1 + rank2 - 4) / 26.0 + (0.1 if suited else 0.0)
+            if hand_strength > 0.7:  # Сильная рука (например, высокие пары или AKs)
+                for i, action in enumerate(legal_actions):
+                    if action.action_type in [ActionType.RAISE, ActionType.BET]:
+                        masked_probs[i] *= 1.5  # Увеличиваем вероятность агрессивных действий
+                masked_probs = masked_probs / np.sum(masked_probs) if np.sum(masked_probs) > 0 else masked_probs
 
         if deterministic:
             action_idx = np.argmax(masked_probs)
@@ -307,7 +326,7 @@ class PPOSolver:
                         returns: np.ndarray, advantages: np.ndarray,
                         old_log_probs: np.ndarray) -> Dict[str, float]:
         if not HAS_TORCH:
-            raise ImportError("PyTorch is required for this method")
+            raise ImportError("Для этого метода требуется PyTorch")
 
         states_tensor = torch.FloatTensor(states).to(self.device)
         returns_tensor = torch.FloatTensor(returns).to(self.device)
@@ -352,7 +371,7 @@ class PPOSolver:
                            returns: np.ndarray, advantages: np.ndarray,
                            old_log_probs: np.ndarray) -> Dict[str, float]:
         if not HAS_TF:
-            raise ImportError("TensorFlow is required for this method")
+            raise ImportError("Для этого метода требуется TensorFlow")
 
         with tf.device(self.device):
             states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
@@ -451,7 +470,7 @@ class PPOSolver:
             metadata = np.load(f"{filepath}_metadata.npy", allow_pickle=True).item()
             if metadata['algorithm'] != 'PPO' or metadata['framework'] != self.framework or \
                metadata['input_dim'] != self.input_dim or metadata['output_dim'] != self.output_dim:
-                print("Error: Incompatible model metadata")
+                print("Ошибка: Несовместимые метаданные модели")
                 return False
 
             if self.framework == "pytorch":
@@ -462,13 +481,13 @@ class PPOSolver:
             else:
                 actor_path = f"{filepath}_actor"
                 critic_path = f"{filepath}_critic"
-                self.actor_network = tf.keras.models.load_model(actor_path)
-                self.critic_network = tf.keras.models.load_model(critic_path)
+                self.actor_network = models.load_model(actor_path)
+                self.critic_network = models.load_model(critic_path)
 
             self.iterations = metadata['iterations']
             return True
         except Exception as e:
-            print(f"Error loading model: {e}")
+            print(f"Ошибка загрузки модели: {e}")
             return False
 
     def get_action_probabilities(self, state: Any, player_id: int) -> np.ndarray:
@@ -476,7 +495,7 @@ class PPOSolver:
         action_probs, _ = self._forward_actor(state_vec)
         legal_actions = state.get_legal_actions()
         if not legal_actions and not state.is_terminal():
-            raise ValueError("No legal actions available in non-terminal state")
+            raise ValueError("Нет доступных действий в нетерминальном состоянии")
 
         legal_mask = np.zeros(self.output_dim)
         for i in range(min(len(legal_actions), len(legal_mask))):
@@ -489,58 +508,58 @@ class PPOSolver:
             masked_probs = legal_mask / np.sum(legal_mask)
         return masked_probs
 
+# Определение сетей PyTorch только если PyTorch доступен
+if HAS_TORCH:
+    class ActorNetworkPyTorch(nn.Module):
+        def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+            super().__init__()
+            self.fc1 = nn.Linear(input_dim, hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.fc3 = nn.Linear(hidden_dim, output_dim)
 
-class ActorNetworkPyTorch(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
+        def forward(self, x):
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
+            x = F.softmax(self.fc3(x), dim=-1)
+            return x
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.softmax(self.fc3(x), dim=-1)
-        return x
+    class CriticNetworkPyTorch(nn.Module):
+        def __init__(self, input_dim: int, hidden_dim: int):
+            super().__init__()
+            self.fc1 = nn.Linear(input_dim, hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.fc3 = nn.Linear(hidden_dim, 1)
 
+        def forward(self, x):
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
+            x = self.fc3(x)
+            return x
 
-class CriticNetworkPyTorch(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+# Определение сетей TensorFlow только если TensorFlow доступен
+if HAS_TF:
+    class ActorNetworkTensorFlow(tf.keras.Model):
+        def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+            super().__init__()
+            self.fc1 = layers.Dense(hidden_dim, activation='relu')
+            self.fc2 = layers.Dense(hidden_dim, activation='relu')
+            self.fc3 = layers.Dense(output_dim, activation='softmax')
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        def call(self, inputs, training=False):
+            x = self.fc1(inputs)
+            x = self.fc2(x)
+            x = self.fc3(x)
+            return x
 
+    class CriticNetworkTensorFlow(tf.keras.Model):
+        def __init__(self, input_dim: int, hidden_dim: int):
+            super().__init__()
+            self.fc1 = layers.Dense(hidden_dim, activation='relu')
+            self.fc2 = layers.Dense(hidden_dim, activation='relu')
+            self.fc3 = layers.Dense(1)
 
-class ActorNetworkTensorFlow(tf.keras.Model):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
-        super().__init__()
-        self.fc1 = tf.keras.layers.Dense(hidden_dim, activation='relu')
-        self.fc2 = tf.keras.layers.Dense(hidden_dim, activation='relu')
-        self.fc3 = tf.keras.layers.Dense(output_dim, activation='softmax')
-
-    def call(self, inputs, training=False):
-        x = self.fc1(inputs)
-        x = self.fc2(x)
-        x = self.fc3(x)
-        return x
-
-
-class CriticNetworkTensorFlow(tf.keras.Model):
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.fc1 = tf.keras.layers.Dense(hidden_dim, activation='relu')
-        self.fc2 = tf.keras.layers.Dense(hidden_dim, activation='relu')
-        self.fc3 = tf.keras.layers.Dense(1)
-
-    def call(self, inputs, training=False):
-        x = self.fc1(inputs)
-        x = self.fc2(x)
-        x = self.fc3(x)
-        return x
+        def call(self, inputs, training=False):
+            x = self.fc1(inputs)
+            x = self.fc2(x)
+            x = self.fc3(x)
+            return x

@@ -1,17 +1,17 @@
 """
-Game module containing the core poker game mechanics.
-
-This module includes classes for cards, decks, hand evaluation, game state management,
-and different game modes like Spin and Go.
+Initialization file for the pokersim.game package.
 """
 
-from pokersim.game.card import Card, Suit, Rank
-from pokersim.game.deck import Deck
-from pokersim.game.state import GameState, Action, ActionType, Stage
-from pokersim.game.evaluator import HandEvaluator
-from pokersim.game.spingo import SpinGoGame
+from .card import Card, Suit, Rank
+from .deck import Deck
+from .evaluator import HandEvaluator
+from .spingo import SpinGoGame
+from .state import GameState, Action, ActionType, Stage
 
 __all__ = [
-    "Card", "Suit", "Rank", "Deck", "GameState", "Action", "ActionType", 
-    "Stage", "HandEvaluator", "SpinGoGame"
+    'Card', 'Suit', 'Rank',
+    'Deck',
+    'HandEvaluator',
+    'SpinGoGame',
+    'GameState', 'Action', 'ActionType', 'Stage'
 ]

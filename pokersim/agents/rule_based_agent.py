@@ -9,7 +9,6 @@ from pokersim.agents.base_agent import Agent
 from pokersim.game.state import GameState, Action, ActionType, Stage
 from pokersim.game.evaluator import HandEvaluator
 
-
 class RuleBased1Agent(Agent):
     """
     A rule-based agent that plays based on hand strength and pot odds.
@@ -18,7 +17,6 @@ class RuleBased1Agent(Agent):
         player_id (int): The ID of the player controlled by this agent.
         aggression (float): How aggressively the agent plays (0.0-1.0).
     """
-
     def __init__(self, player_id: int, aggression: float = 0.5):
         super().__init__(player_id)
         self.aggression = max(0.0, min(1.0, aggression))
@@ -31,11 +29,10 @@ class RuleBased1Agent(Agent):
         hand_strength = self._evaluate_hand_strength(game_state)
         hand_strength = hand_strength * (1.0 + self.aggression)
         pot_odds = self._calculate_pot_odds(game_state)
-
         return self._select_action(legal_actions, hand_strength, pot_odds)
 
     def _evaluate_hand_strength(self, game_state: GameState) -> float:
-        hole_cards = game_state.hole_cards[self.player_id]
+        hole_cards = game_state.hole_cards[game_state.player_ids.index(self.player_id)]
         community_cards = game_state.community_cards
         if game_state.stage == Stage.PREFLOP:
             return self._evaluate_preflop(hole_cards)
@@ -61,7 +58,7 @@ class RuleBased1Agent(Agent):
 
     def _calculate_pot_odds(self, game_state: GameState) -> float:
         pot_size = game_state.pot + sum(game_state.current_bets)
-        amount_to_call = max(game_state.current_bets) - game_state.current_bets[self.player_id] if max(game_state.current_bets) > game_state.current_bets[self.player_id] else 0
+        amount_to_call = max(game_state.current_bets) - game_state.current_bets[game_state.player_ids.index(self.player_id)] if max(game_state.current_bets) > game_state.current_bets[game_state.player_ids.index(self.player_id)] else 0
         return amount_to_call / (pot_size + amount_to_call) if pot_size > 0 and amount_to_call > 0 else 0.0
 
     def _select_action(self, legal_actions: List[Action], hand_strength: float, pot_odds: float) -> Action:
@@ -79,7 +76,6 @@ class RuleBased1Agent(Agent):
                         return action
         return legal_actions[0]
 
-
 class RuleBased2Agent(Agent):
     """
     A more sophisticated rule-based agent that plays based on hand strength, pot odds, and position.
@@ -89,7 +85,6 @@ class RuleBased2Agent(Agent):
         aggression (float): How aggressively the agent plays (0.0-1.0).
         bluff_frequency (float): How often the agent bluffs (0.0-1.0).
     """
-
     def __init__(self, player_id: int, aggression: float = 0.5, bluff_frequency: float = 0.1):
         super().__init__(player_id)
         self.aggression = max(0.0, min(1.0, aggression))
@@ -108,11 +103,10 @@ class RuleBased2Agent(Agent):
         if bluffing:
             hand_strength = 0.8 + 0.2 * random.random()
         pot_odds = self._calculate_pot_odds(game_state)
-
         return self._select_action(legal_actions, hand_strength, pot_odds)
 
     def _evaluate_hand_strength(self, game_state: GameState) -> float:
-        hole_cards = game_state.hole_cards[self.player_id]
+        hole_cards = game_state.hole_cards[game_state.player_ids.index(self.player_id)]
         community_cards = game_state.community_cards
         if game_state.stage == Stage.PREFLOP:
             return self._evaluate_preflop(hole_cards)
@@ -138,12 +132,12 @@ class RuleBased2Agent(Agent):
 
     def _calculate_pot_odds(self, game_state: GameState) -> float:
         pot_size = game_state.pot + sum(game_state.current_bets)
-        amount_to_call = max(game_state.current_bets) - game_state.current_bets[self.player_id] if max(game_state.current_bets) > game_state.current_bets[self.player_id] else 0
+        amount_to_call = max(game_state.current_bets) - game_state.current_bets[game_state.player_ids.index(self.player_id)] if max(game_state.current_bets) > game_state.current_bets[game_state.player_ids.index(self.player_id)] else 0
         return amount_to_call / (pot_size + amount_to_call) if pot_size > 0 and amount_to_call > 0 else 0.0
 
     def _calculate_stack_to_pot_ratio(self, game_state: GameState) -> float:
         pot_size = game_state.pot + sum(game_state.current_bets)
-        stack = game_state.stacks[self.player_id]
+        stack = game_state.stacks[game_state.player_ids.index(self.player_id)]
         return stack / pot_size if pot_size > 0 else float('inf')
 
     def _evaluate_position(self, game_state: GameState) -> float:

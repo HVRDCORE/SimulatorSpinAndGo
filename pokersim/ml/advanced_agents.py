@@ -1,8 +1,8 @@
 """
-Implementation of advanced machine learning-based agents for poker simulations.
+Реализация продвинутых агентов на основе машинного обучения для покерных симуляций.
 
-This module provides sophisticated agent implementations that leverage neural networks
-and reinforcement learning techniques to make poker decisions.
+Этот модуль предоставляет сложные реализации агентов, использующих нейронные сети
+и методы обучения с подкреплением для принятия решений в покере.
 """
 
 import numpy as np
@@ -22,44 +22,48 @@ from pokersim.ml.models import PokerMLP, PokerCNN, PokerActorCritic
 from pokersim.algorithms.deep_cfr import DeepCFRSolver
 from pokersim.algorithms.ppo import PPOSolver
 
-# Configure logger
+# Настройка логгера
 logger = logging.getLogger(__name__)
 
 class DeepCFRAgent(Agent):
     """
-    An agent that uses Deep Counterfactual Regret Minimization for decision making.
+    Агент, использующий Deep Counterfactual Regret Minimization для принятия решений.
 
-    This agent uses a neural network trained with Deep CFR to approximate optimal
-    strategy in imperfect information games like poker.
+    Этот агент использует нейронную сеть, обученную с помощью Deep CFR, для аппроксимации
+    оптимальной стратегии в играх с неполной информацией, таких как покер.
 
-    Attributes:
-        player_id (int): The ID of the player controlled by this agent.
-        deep_cfr (DeepCFRSolver): The Deep CFR algorithm.
-        device (torch.device): Device for computation (CPU/GPU).
-        epsilon (float): Exploration rate for epsilon-greedy strategy.
+    Атрибуты:
+        player_id (int): Идентификатор игрока, управляемого агентом.
+        deep_cfr (DeepCFRSolver): Алгоритм Deep CFR.
+        device (torch.device): Устройство для вычислений (CPU/GPU).
+        epsilon (float): Скорость исследования для стратегии epsilon-greedy.
     """
 
     def __init__(self, player_id: int, game_state_class: Any, num_players: int = 2,
                  device: Optional[torch.device] = None, epsilon: float = 0.05, framework: str = "auto"):
         super().__init__(player_id)
-        self.deep_cfr = DeepCFRSolver(game_state_class=game_state_class, framework=framework)
+        self.deep_cfr = DeepCFRSolver(game_state_class=game_state_class, num_players=num_players, framework=framework)
         self.device = device if device is not None else torch.device("cpu")
         self.epsilon = epsilon
 
     def act(self, game_state: GameState) -> Action:
         legal_actions = game_state.get_legal_actions()
         if not legal_actions:
-            raise ValueError("No legal actions available")
+            logger.error(f"PPOAgent {self.player_id}: Нет доступных действий")
+            raise ValueError("Нет доступных действий")
 
-        if random.random() < self.epsilon:
-            return random.choice(legal_actions)
+        # Уменьшаем epsilon для более детерминированных действий
+        if random.random() < self.epsilon * 0.5:  # Уменьшаем вероятность случайного действия
+            action = random.choice(legal_actions)
+            logger.debug(f"PPOAgent {self.player_id}: Выбрано случайное действие {action}")
+            return action
 
-        action_probs = self.deep_cfr.get_action_probabilities(game_state)
-        if len(action_probs) != len(legal_actions):
-            logger.warning(f"Action probabilities mismatch: {len(action_probs)} vs {len(legal_actions)}")
-            action_probs = np.ones(len(legal_actions)) / len(legal_actions)
-        action_idx = np.random.choice(len(legal_actions), p=action_probs)
-        return legal_actions[action_idx]
+        action, _, _ = self.ppo.get_action(game_state, self.player_id)
+        if action not in legal_actions:
+            logger.error(f"PPOAgent {self.player_id}: Модель вернула недопустимое действие {action}, выбор случайного")
+            action = random.choice(legal_actions)
+        logger.debug(f"PPOAgent {self.player_id}: Выбрано модельное действие {action}")
+        return action
 
     def observe(self, game_state: GameState) -> None:
         pass
@@ -77,31 +81,31 @@ class DeepCFRAgent(Agent):
 
 class PPOAgent(Agent):
     """
-    An agent that uses Proximal Policy Optimization for decision making.
+    Агент, использующий Proximal Policy Optimization для принятия решений.
 
-    This agent employs a neural network trained with PPO to select actions
-    in Spin and Go poker games, balancing exploration and exploitation.
+    Этот агент использует нейронную сеть, обученную с помощью PPO, для выбора действий
+    в играх Spin and Go, балансируя между исследованием и использованием.
 
-    Attributes:
-        player_id (int): The ID of the player controlled by this agent.
-        ppo (PPOSolver): The PPO algorithm instance.
-        device (torch.device): Device for computation (CPU/GPU).
-        epsilon (float): Exploration rate for epsilon-greedy strategy.
+    Атрибуты:
+        player_id (int): Идентификатор игрока, управляемого агентом.
+        ppo (PPOSolver): Экземпляр алгоритма PPO.
+        device (torch.device): Устройство для вычислений (CPU/GPU).
+        epsilon (float): Скорость исследования для стратегии epsilon-greedy.
     """
 
     def __init__(self, player_id: int, game_state_class: Any, num_players: int = 3,
                  device: Optional[torch.device] = None, epsilon: float = 0.1,
                  framework: str = "auto"):
         """
-        Initialize the PPO agent.
+        Инициализация агента PPO.
 
-        Args:
-            player_id (int): The ID of the player controlled by this agent.
-            game_state_class: Class for creating game states.
-            num_players (int, optional): Number of players. Defaults to 3.
-            device (torch.device, optional): Device for computation. Defaults to None.
-            epsilon (float, optional): Exploration rate. Defaults to 0.1.
-            framework (str, optional): ML framework ('pytorch' or 'tensorflow'). Defaults to "auto".
+        Аргументы:
+            player_id (int): Идентификатор игрока, управляемого агентом.
+            game_state_class: Класс для создания игровых состояний.
+            num_players (int, optional): Количество игроков. По умолчанию 3.
+            device (torch.device, optional): Устройство для вычислений. По умолчанию None.
+            epsilon (float, optional): Скорость исследования. По умолчанию 0.1.
+            framework (str, optional): Фреймворк ML ('pytorch' или 'tensorflow'). По умолчанию "auto".
         """
         super().__init__(player_id)
         self.ppo = PPOSolver(game_state_class=game_state_class, num_players=num_players, framework=framework)
@@ -110,87 +114,87 @@ class PPOAgent(Agent):
 
     def act(self, game_state: GameState) -> Action:
         """
-        Choose an action for the current game state.
+        Выбор действия для текущего игрового состояния.
 
-        Args:
-            game_state (GameState): The current game state.
+        Аргументы:
+            game_state (GameState): Текущее игровое состояние.
 
-        Returns:
-            Action: The chosen action.
+        Возвращает:
+            Action: Выбранное действие.
         """
         legal_actions = game_state.get_legal_actions()
         if not legal_actions:
-            logger.error(f"PPOAgent {self.player_id}: No legal actions available")
-            raise ValueError("No legal actions available")
+            logger.error(f"PPOAgent {self.player_id}: Нет доступных действий")
+            raise ValueError("Нет доступных действий")
 
         if random.random() < self.epsilon:
             action = random.choice(legal_actions)
-            logger.debug(f"PPOAgent {self.player_id}: Selected random action {action}")
+            logger.debug(f"PPOAgent {self.player_id}: Выбрано случайное действие {action}")
             return action
 
         action, _, _ = self.ppo.get_action(game_state, self.player_id)
         if action not in legal_actions:
-            logger.error(f"PPOAgent {self.player_id}: Model returned illegal action {action}, choosing random")
+            logger.error(f"PPOAgent {self.player_id}: Модель вернула недопустимое действие {action}, выбор случайного")
             action = random.choice(legal_actions)
-        logger.debug(f"PPOAgent {self.player_id}: Selected model action {action}")
+        logger.debug(f"PPOAgent {self.player_id}: Выбрано модельное действие {action}")
         return action
 
     def observe(self, game_state: GameState) -> None:
         """
-        Observe the game state (no-op for PPO).
+        Наблюдение за игровым состоянием (без действий для PPO).
 
-        Args:
-            game_state (GameState): The current game state.
+        Аргументы:
+            game_state (GameState): Текущее игровое состояние.
         """
         pass
 
     def train(self, num_iterations: int = 100, num_trajectories: int = 1000) -> Dict[str, float]:
         """
-        Train the PPO agent.
+        Обучение агента PPO.
 
-        Args:
-            num_iterations (int, optional): Number of iterations. Defaults to 100.
-            num_trajectories (int, optional): Number of trajectories per iteration. Defaults to 1000.
+        Аргументы:
+            num_iterations (int, optional): Количество итераций. По умолчанию 100.
+            num_trajectories (int, optional): Количество траекторий за итерацию. По умолчанию 1000.
 
-        Returns:
-            Dict[str, float]: Training metrics.
+        Возвращает:
+            Dict[str, float]: Метрики обучения.
         """
         metrics = self.ppo.train(num_iterations=num_iterations, num_trajectories=num_trajectories)
         return metrics
 
     def save(self, path: str) -> None:
         """
-        Save the PPO model.
+        Сохранение модели PPO.
 
-        Args:
-            path (str): Path to save the model.
+        Аргументы:
+            path (str): Путь для сохранения модели.
         """
         self.ppo.save(path)
 
     def load(self, path: str) -> None:
         """
-        Load the PPO model.
+        Загрузка модели PPO.
 
-        Args:
-            path (str): Path to the saved model.
+        Аргументы:
+            path (str): Путь к сохранённой модели.
         """
         self.ppo.load(path)
 
 
 class ImitationLearningAgent(Agent):
     """
-    An agent that uses Imitation Learning to mimic expert strategies.
+    Агент, использующий имитационное обучение для подражания экспертным стратегиям.
 
-    This agent learns to imitate the behavior of expert agents by observing their actions.
+    Этот агент учится имитировать поведение экспертных агентов, наблюдая за их действиями.
 
-    Attributes:
-        player_id (int): The ID of the player controlled by this agent.
-        model (nn.Module): The neural network model.
-        optimizer (optim.Optimizer): The optimizer.
-        device (torch.device): Device for computation (CPU/GPU).
-        expert (Agent): The expert agent to imitate.
-        memory (List): Memory of state-action pairs.
-        batch_size (int): Batch size for training.
+    Атрибуты:
+        player_id (int): Идентификатор игрока, управляемого агентом.
+        model (nn.Module): Модель нейронной сети.
+        optimizer (optim.Optimizer): Оптимизатор.
+        device (torch.device): Устройство для вычислений (CPU/GPU).
+        expert (Agent): Экспертный агент для подражания.
+        memory (List): Память пар состояний и действий.
+        batch_size (int): Размер пакета для обучения.
     """
 
     def __init__(self, player_id: int, input_dim: int, hidden_dims: List[int], action_dim: int,
@@ -207,34 +211,27 @@ class ImitationLearningAgent(Agent):
     def act(self, game_state: GameState) -> Action:
         legal_actions = game_state.get_legal_actions()
         if not legal_actions:
-            logger.error(f"ImitationLearningAgent {self.player_id}: No legal actions available")
-            raise ValueError("No legal actions available")
+            logger.error(f"ImitationLearningAgent {self.player_id}: Нет доступных действий")
+            raise ValueError("Нет доступных действий")
 
-        # If we have an expert, collect demonstration
         if self.expert and game_state.current_player == self.player_id:
             expert_action = self.expert.act(game_state)
             self._add_to_memory(game_state, expert_action, legal_actions)
 
-        # Convert state to tensor
         state_tensor = self._state_to_tensor(game_state)
 
-        # Forward pass
         with torch.no_grad():
             action_logits = self.model(state_tensor).squeeze(0)
-
-            # Filter illegal actions
             legal_mask = torch.zeros(action_logits.size(0), dtype=torch.bool)
             for i in range(min(len(legal_actions), action_logits.size(0))):
                 legal_mask[i] = True
 
             masked_logits = action_logits.clone()
             masked_logits[~legal_mask] = float('-inf')
-
-            # Sample action
             probs = F.softmax(masked_logits, dim=0)
             action_idx = torch.multinomial(probs, 1).item()
 
-            logger.debug(f"ImitationLearningAgent {self.player_id}: Selected action {legal_actions[action_idx]}")
+            logger.debug(f"ImitationLearningAgent {self.player_id}: Выбрано действие {legal_actions[action_idx]}")
             return legal_actions[action_idx]
 
     def _state_to_tensor(self, game_state: GameState) -> torch.Tensor:
@@ -271,7 +268,7 @@ class ImitationLearningAgent(Agent):
         self.memory = self.memory[self.batch_size:]
 
     def train_episode(self) -> None:
-        """Train the model after collecting demonstrations for an episode."""
+        """Обучение модели после сбора демонстраций за эпизод."""
         if len(self.memory) >= self.batch_size:
             self._train_step()
 
@@ -289,13 +286,13 @@ class ImitationLearningAgent(Agent):
 
 class HeuristicNetwork(nn.Module):
     """
-    A neural network that combines heuristic knowledge with learned representations.
+    Нейронная сеть, сочетающая эвристические знания с обученными представлениями.
 
-    Attributes:
-        input_dim (int): The input dimension.
-        hidden_dims (List[int]): The hidden layer dimensions.
-        output_dim (int): The output dimension.
-        heuristic_dim (int): The dimension of heuristic features.
+    Атрибуты:
+        input_dim (int): Размер входных данных.
+        hidden_dims (List[int]): Размеры скрытых слоёв.
+        output_dim (int): Размер выходных данных.
+        heuristic_dim (int): Размер эвристических признаков.
     """
 
     def __init__(self, input_dim: int, hidden_dims: List[int], output_dim: int, heuristic_dim: int = 5):
@@ -326,17 +323,17 @@ class HeuristicNetwork(nn.Module):
 
 class HybridAgent(Agent):
     """
-    An agent that combines heuristics with neural network learning.
+    Агент, сочетающий эвристики с обучением нейронной сети.
 
-    Attributes:
-        player_id (int): The ID of the player controlled by this agent.
-        model (HeuristicNetwork): The neural network model.
-        optimizer (optim.Optimizer): The optimizer.
-        device (torch.device): Device for computation (CPU/GPU).
-        memory (List): Memory of experiences.
-        batch_size (int): Batch size for training.
-        gamma (float): Discount factor.
-        epsilon (float): Exploration rate for epsilon-greedy strategy.
+    Атрибуты:
+        player_id (int): Идентификатор игрока, управляемого агентом.
+        model (HeuristicNetwork): Модель нейронной сети.
+        optimizer (optim.Optimizer): Оптимизатор.
+        device (torch.device): Устройство для вычислений (CPU/GPU).
+        memory (List): Память опытов.
+        batch_size (int): Размер пакета для обучения.
+        gamma (float): Фактор дисконтирования.
+        epsilon (float): Скорость исследования для стратегии epsilon-greedy.
     """
 
     def __init__(self, player_id: int, input_dim: int, hidden_dims: List[int], action_dim: int,
@@ -358,12 +355,12 @@ class HybridAgent(Agent):
     def act(self, game_state: GameState) -> Action:
         legal_actions = game_state.get_legal_actions()
         if not legal_actions:
-            logger.error(f"HybridAgent {self.player_id}: No legal actions available")
-            raise ValueError("No legal actions available")
+            logger.error(f"HybridAgent {self.player_id}: Нет доступных действий")
+            raise ValueError("Нет доступных действий")
 
         if random.random() < self.epsilon:
             self.current_action = random.choice(legal_actions)
-            logger.debug(f"HybridAgent {self.player_id}: Selected random action {self.current_action}")
+            logger.debug(f"HybridAgent {self.player_id}: Выбрано случайное действие {self.current_action}")
             return self.current_action
 
         heuristic_features = self._calculate_heuristic_features(game_state)
@@ -385,7 +382,7 @@ class HybridAgent(Agent):
             action_idx = torch.multinomial(probs, 1).item()
 
             self.current_action = legal_actions[action_idx]
-            logger.debug(f"HybridAgent {self.player_id}: Selected model action {self.current_action}")
+            logger.debug(f"HybridAgent {self.player_id}: Выбрано модельное действие {self.current_action}")
             return self.current_action
 
     def _state_to_tensor(self, game_state: GameState) -> torch.Tensor:
@@ -395,7 +392,7 @@ class HybridAgent(Agent):
 
     def _calculate_heuristic_features(self, game_state: GameState) -> List[float]:
         if self.player_id >= len(game_state.hole_cards) or self.player_id >= len(game_state.stacks):
-            logger.warning(f"HybridAgent {self.player_id}: Invalid player_id for state access")
+            logger.warning(f"HybridAgent {self.player_id}: Недопустимый player_id для доступа к состоянию")
             return [0.0] * 5
 
         features = []
