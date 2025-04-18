@@ -1,6 +1,6 @@
 """
-Unit tests for the pokersim package.
+Test package for the poker simulator.
 
-This package contains tests for the core functionality of the poker simulation
-framework, including game mechanics, agents, and ML algorithms.
+This package contains all tests for the poker simulator, including unit tests,
+integration tests, and stress tests.
 """
