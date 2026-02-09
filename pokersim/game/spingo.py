@@ -109,9 +109,13 @@ class SpinGoGame:
             self.current_game = None
             return
 
+        # Calculate total initial stacks for this hand to track chip conservation
+        initial_total_stacks = sum([self.player_stacks[player_id] for player_id in self.current_game.player_ids])
+        
         eliminated_this_hand = []
         for i, player_id in enumerate(self.current_game.player_ids):
-            self.player_stacks[player_id] += payouts[i]
+            # Only update the stack difference from the payout (not adding the entire payout)
+            self.player_stacks[player_id] = self.player_stacks[player_id] - self.current_game.current_bets[i] + payouts[i]
             if self.player_stacks[player_id] < 0:
                 logger.error(f"Отрицательный стек для игрока {player_id}: {self.player_stacks[player_id]}")
                 self.player_stacks[player_id] = 0  # Корректируем отрицательный стек

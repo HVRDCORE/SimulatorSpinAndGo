@@ -155,7 +155,8 @@ class GameState:
         return True
 
     def _advance_stage(self) -> None:
-        self.pot += sum(self.current_bets)
+        # Move current bets to the pot only if they haven't been moved yet
+        # The bets are already included in the pot during action application, so we just reset current_bets
         self.current_bets = [0] * self.num_players
         self.last_raiser = -1
         self.min_raise = self.big_blind
